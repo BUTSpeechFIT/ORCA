@@ -1,50 +1,22 @@
 import argparse
 import os
+import random
+from datetime import datetime
 from functools import partial
 
 import accelerate
+import numpy as np
 import torch
 import tqdm
 import yaml
 from peft import LoraConfig, PeftModel, get_peft_model
 from scipy.stats import kendalltau, spearmanr
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
 from transformers import (AutoModel, AutoModelForCausalLM, AutoTokenizer,
                           BitsAndBytesConfig)
 
 from orca_score import data, model
-
-
-def save_checkpoint(
-    scoring_model,
-    output_dir,
-    accelerator=None,
-    optimizer=None,
-    metrics=None,
-    args=None,
-    tokenizer=None,
-):
-    """
-    Save the model and optimizer state to a checkpoint directory.
-    """
-    os.makedirs(output_dir, exist_ok=True)
-    if accelerator is None:
-        scoring_model.save_to_directory(os.path.join(output_dir, "model"))
-    else:
-        accelerator.unwrap_model(scoring_model).save_to_directory(
-            os.path.join(output_dir, "model")
-        )
-    if optimizer is not None:
-        torch.save(optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
-    if args is not None:
-        with open(os.path.join(output_dir, "args.yaml"), "w") as f:
-            yaml.dump(vars(args), f)
-    if metrics is not None:
-        with open(os.path.join(output_dir, "metrics.yaml"), "w") as f:
-            yaml.dump(metrics, f)
-    if tokenizer is not None:
-        tokenizer.save_pretrained(os.path.join(output_dir, "tokenizer"))
+from orca_score.utils import CompositeWriter, save_checkpoint
 
 
 def lr_lambda_linear_with_min_lr(step, args):
@@ -58,46 +30,36 @@ def lr_lambda_linear_with_min_lr(step, args):
     return max(current_lr, min_lr) / peak_lr
 
 
-class FakeWriter:
-    def __init__(self, *args, **kwargs):
-        pass
-
-    def add_scalar(self, *args, **kwargs):
-        pass
-
-    def flush(self):
-        pass
-
-    def close(self):
-        pass
-
-
 def parse_arguments():
+    """Parse command line arguments for training the ORCA model."""
 
     parser = argparse.ArgumentParser(
         description="Train ORCA model.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument(
+
+    data_group = parser.add_argument_group("Input data related arguments")
+
+    data_group.add_argument(
         "--train_data",
         type=str,
         nargs="+",
         required=True,
         help="Paths to training data files. Can be multiple files for different splits.",
     )
-    parser.add_argument(
+    data_group.add_argument(
         "--val_data",
         type=str,
         required=True,
         help="Path to validation data file.",
     )
-    parser.add_argument(
+    data_group.add_argument(
         "--max_data_length",
         type=int,
         default=1000,
         help="Maximum length of input text in characters.",
     )
-    parser.add_argument(
+    data_group.add_argument(
         "--dataset_sampling_weights",
         type=float,
         nargs="+",
@@ -105,47 +67,49 @@ def parse_arguments():
         help="Weights for sampling from different datasets. "
         "If not provided, datasets will just be concatenated.",
     )
-    parser.add_argument(
+    data_group.add_argument(
         "--skip_rationale",
         action="store_true",
         help="If set, the model will not use rationales for scoring.",
     )
-    parser.add_argument(
+    data_group.add_argument(
         "--skip_question",
         action="store_true",
         help="If set, the model will not use questions for scoring.",
     )
-    parser.add_argument(
+    data_group.add_argument(
         "--add_transcript",
         action="store_true",
         help="If set, the model will use transcriptions for scoring.",
     )
 
-    parser.add_argument(
+    data_group.add_argument(
         "--prompts_yaml",
         type=str,
         default=None,
         help="Path to YAML file with prompts for the model.",
     )
-    parser.add_argument(
+
+    model_group = parser.add_argument_group("Model related arguments")
+    model_group.add_argument(
         "--score_type",
         type=str,
         default="beta",
         choices=["bernoulli", "beta", "mse", "bmm"],
-        help='Type of scoring to use for training the model.',
+        help="Type of scoring to use for training the model.",
     )
-    parser.add_argument(
+    model_group.add_argument(
         "--model",
         type=str,
         default="google/gemma-3-1b-it",
         help="LLM to initialize from.",
     )
-    parser.add_argument(
+    model_group.add_argument(
         "--tokenizer",
         type=str,
         help="Path to the tokenizer directory. Defaults to model if unset",
     )
-    parser.add_argument(
+    model_group.add_argument(
         "--layers_to_use",
         nargs="+",
         type=int,
@@ -153,107 +117,125 @@ def parse_arguments():
         help="List of layer indices to use for scoring. If not provided, all layers will be used.",
     )
 
-    parser.add_argument("--lora_rank", type=int, help="LoRA rank, default is no LoRA")
-    parser.add_argument(
+    model_group.add_argument(
+        "--lora_rank", type=int, help="LoRA rank, default is no LoRA"
+    )
+    model_group.add_argument(
         "--quantization_level",
         type=str,
         default="none",
         choices=["none", "4bit", "8bit"],
         help="Quantization level to use for the model.",
     )
-    parser.add_argument(
+    model_group.add_argument(
         "--use_cls_token",
         action="store_true",
         help="If set, the model will append a CLS token for scoring.",
     )
-    parser.add_argument(
+    model_group.add_argument(
         "--use_flash_attention",
         action="store_true",
         help="If set, the model will use Flash Attention 2 for faster attention computation. Requires flash-attn package.",
     )
 
-    parser.add_argument(
+    training_group = parser.add_argument_group("Training related arguments")
+
+    training_group.add_argument(
         "--load_checkpoint",
         type=str,
         default=None,
         help="Path to a checkpoint to load the model from.",
     )
-    parser.add_argument(
+    training_group.add_argument(
         "--resume",
         action="store_true",
         help="Whether to resume training from the latest checkpoint.",
     )
 
-    parser.add_argument(
+    training_group.add_argument(
         "--max_steps", type=int, default=4000, help="Number of training steps."
     )
-    parser.add_argument(
-        "--val_steps", type=int, default=100, help="Number of steps between validation."
+    training_group.add_argument(
+        "--val_steps", type=int, default=200, help="Number of steps between validation."
     )
-    parser.add_argument(
+    training_group.add_argument(
         "--save_steps", type=int, default=500, help="Number of steps between saves."
     )
-    parser.add_argument(
+    training_group.add_argument(
         "--batch_size", type=int, default=1, help="Batch size for training."
     )
-    parser.add_argument(
+    training_group.add_argument(
         "--accumulation_steps",
         type=int,
         default=4,
         help="Number of gradient accumulation steps.",
     )
-    parser.add_argument(
+    training_group.add_argument(
         "--warmup_steps",
         type=int,
         default=100,
         help="Number of warmup steps for learning rate.",
     )
-    parser.add_argument(
-        "--peak_lr", type=float, default=1e-5, help="Peak learning rate for training."
+    training_group.add_argument(
+        "--peak_lr", type=float, default=5e-5, help="Peak learning rate for training."
     )
-    parser.add_argument(
+    training_group.add_argument(
         "--min_lr_ratio",
         type=float,
-        default=0.1,
+        default=0.01,
         help="Minimum learning rate ratio relative to peak learning rate.",
     )
-    parser.add_argument(
+    training_group.add_argument(
         "--weight_decay", type=float, default=0, help="Weight decay for optimizer."
     )
-    parser.add_argument(
+    training_group.add_argument(
         "--max_grad_norm",
         type=float,
         default=5.0,
         help="Maximum gradient norm for clipping.",
     )
 
-    parser.add_argument(
+    training_group.add_argument(
         "--early_stopping_patience",
         type=int,
         default=30,
         help="Number of validation steps without improvement before early stopping.",
     )
-    parser.add_argument(
+    training_group.add_argument(
         "--lr_ratio_classifier",
         type=float,
         default=1.0,
         help="Learning rate ratio for the classifier head relative to the LM.",
     )
 
-    parser.add_argument(
-        "--num_workers", type=int, default=4, help="Number of workers for data loading."
+    training_group.add_argument(
+        "--num_workers", type=int, default=1, help="Number of workers for data loading."
     )
-    parser.add_argument(
+    training_group.add_argument(
         "--log_dir",
         type=str,
         default="./logs",
+        required=True,
         help="Directory to save logs for TensorBoard.",
     )
-    parser.add_argument(
+    training_group.add_argument(
         "--output_dir",
         type=str,
         default="./output",
+        required=True,
         help="Directory to save the trained model.",
+    )
+    training_group.add_argument(
+        "--exp_name",
+        type=str,
+        default=None,
+        help="Experiment name for logging. If not provided, will be auto-generated from hyperparameters.",
+    )
+    training_group.add_argument(
+        "--seed",
+        type=int,
+        default=108,
+        help="Random seed for reproducibility.",
     )
 
     args = parser.parse_args()
@@ -261,9 +243,150 @@ def parse_arguments():
     return args
 
 
+@torch.no_grad()
+def evaluate(
+    scoring_model,
+    val_dataloader,
+    accelerator,
+    logging_dict,
+    j,
+    writer,
+    best_val_rho,
+    args,
+):
+    device = accelerator.device
+
+    val_loss = 0
+    val_count = 0
+    all_val_annotations = []
+    all_val_predictions = []
+    all_val_params = []
+
+    all_val_variance_annotations = []
+    all_val_variance_predictions = []
+
+    for val_batch in tqdm.tqdm(val_dataloader, disable=not accelerator.is_main_process):
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+            val_outputs = scoring_model(val_batch)
+            loss = val_outputs["loss"]
+        loss = accelerator.gather(loss).mean()
+        val_loss += loss.item()
+        val_count += 1
+
+        val_annotation = val_batch["average_labels"]
+        val_prediction = val_outputs["prob1"]
+        all_val_annotations.extend(val_annotation.cpu().tolist())
+        all_val_predictions.extend(val_prediction.cpu().tolist())
+        all_val_params.extend(val_outputs["params"].cpu().tolist())
+
+        if "label_variance" in val_batch:
+            val_variance_annotation = val_batch["label_variance"]
+            val_variance_prediction = val_outputs["variance"]
+            all_val_variance_annotations.extend(val_variance_annotation.cpu().tolist())
+            all_val_variance_predictions.extend(val_variance_prediction.cpu().tolist())
+    metrics_to_sync = torch.tensor([val_loss, val_count], device=device)
+    metrics_to_sync = accelerator.gather(metrics_to_sync)
+    val_loss = metrics_to_sync[0].sum().item()
+    val_count = metrics_to_sync[1].sum().item()
+
+    with open(
+        os.path.join(
+            args.output_dir,
+            f"val_predictions_{j}_{accelerator.process_index}.yaml",
+        ),
+        "w",
+    ) as f:
+        yaml.dump(
+            {
+                "predictions": all_val_predictions,
+                "annotations": all_val_annotations,
+                "params": all_val_params,
+                "predictions_variance": all_val_variance_predictions,
+                "annotations_variance": all_val_variance_annotations,
+            },
+            f,
+        )
+        accelerator.wait_for_everyone()
+
+    all_val_annotations = []
+    all_val_predictions = []
+    all_val_params = []
+    all_val_variance_annotations = []
+    all_val_variance_predictions = []
+    for i in range(accelerator.num_processes):
+        with open(
+            os.path.join(args.output_dir, f"val_predictions_{j}_{i}.yaml"), "r"
+        ) as f:
+            result_data = yaml.safe_load(f)
+            all_val_annotations.extend(result_data["annotations"])
+            all_val_predictions.extend(result_data["predictions"])
+            all_val_params.extend(result_data["params"])
+            all_val_variance_annotations.extend(result_data["annotations_variance"])
+            all_val_variance_predictions.extend(result_data["predictions_variance"])
+
+    # Calculate Kendall's tau and Spearman's rank correlation
+    kendall_tau = kendalltau(all_val_annotations, all_val_predictions)
+    spearman_corr = spearmanr(all_val_annotations, all_val_predictions)
+
+    variance_kendall_tau = kendalltau(
+        all_val_variance_annotations, all_val_variance_predictions
+    )
+    variance_spearman_corr = spearmanr(
+        all_val_variance_annotations, all_val_variance_predictions
+    )
+
+    if accelerator.is_main_process:
+        writer.add_scalar("Loss/val_loss_mean", val_loss / val_count, j)
+        writer.add_scalar(
+            f"Loss/val_loss_mean_{args.score_type}", val_loss / val_count, j
+        )
+        writer.add_scalar(
+            "Correlations/Mean Kendall's Tau", float(kendall_tau.statistic), j
+        )
+        writer.add_scalar(
+            "Correlations/Mean Spearman's Rank Correlation",
+            float(spearman_corr.statistic),
+            j,
+        )
+        writer.add_scalar(
+            "Correlations/Variance Kendall's Tau",
+            float(variance_kendall_tau.statistic),
+            j,
+        )
+        writer.add_scalar(
+            "Correlations/Variance Spearman's Rank Correlation",
+            float(variance_spearman_corr.statistic),
+            j,
+        )
+
+    logging_dict.update(
+        {
+            "val_loss": round(val_loss / val_count, 6),
+            "best_val_rho": round(max(best_val_rho, float(spearman_corr.statistic)), 6),
+            "variance_tau": round(float(variance_kendall_tau.statistic), 6),
+            "variance_rho": round(float(variance_spearman_corr.statistic), 6),
+            "mean_tau": round(float(kendall_tau.statistic), 6),
+            "mean_rho": round(float(spearman_corr.statistic), 6),
+        }
+    )
+    accelerator.print(logging_dict)
+
+    # Log to JSONL (and TensorBoard if enabled)
+    if accelerator.is_main_process:
+        writer.add_hparams({}, logging_dict)
+
+    return spearman_corr, logging_dict
+
+
 def main():
 
     args = parse_arguments()
+
+    # Set random seeds for reproducibility
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
 
     ddp_kwarg_handler = accelerate.utils.DistributedDataParallelKwargs(
         find_unused_parameters=True
@@ -277,6 +400,10 @@ def main():
 
     # Load the model and tokenizer
     attn_impl = "flash_attention_2" if args.use_flash_attention else None
+
+    accelerator.print(
+        f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'Not Set')}"
+    )
     accelerator.print(
         f"Loading model {args.model} with {args.quantization_level if args.quantization_level != 'none' else 'bfloat16'} precision"
         + (" and flash attention 2" if args.use_flash_attention else "")
@@ -314,7 +441,6 @@ def main():
 
     tokenizer.padding_side = "left"
 
-
     if args.lora_rank is not None and not args.load_checkpoint:
         lora_config = LoraConfig(
             task_type="CAUSAL_LM",
@@ -330,6 +456,8 @@ def main():
         layers_to_use=args.layers_to_use,
         use_cls_token=args.use_cls_token,
     ).to(torch.bfloat16)
+
+    accelerator.print(scoring_model)
 
     if args.prompts_yaml is not None:
         prompts = yaml.safe_load(open(args.prompts_yaml, "r"))
@@ -357,6 +485,7 @@ def main():
             shuffle=True,
             num_workers=args.num_workers,
             collate_fn=collate_fn,
+            pin_memory=True,
         )
     else:
         train_datasets = [
@@ -378,6 +507,7 @@ def main():
                 shuffle=True,
                 num_workers=0,
                 collate_fn=collate_fn,
+                pin_memory=True,
             )
             for train_dataset in train_datasets
         ]
@@ -483,10 +613,10 @@ def main():
         scoring_model, optimizer, train_dataloader, val_dataloader
     )
     accelerator.print(
-        f"Number of total parameters: {sum(p.numel() for p in scoring_model.parameters())}"
+        f"Number of total parameters: {sum(p.numel()/1e6 for p in scoring_model.parameters()):.1f} M"
     )
     accelerator.print(
-        f"Number of trainable parameters: {sum(p.numel() for p in scoring_model.parameters() if p.requires_grad)}"
+        f"Number of trainable parameters: {sum(p.numel()/1e6 for p in scoring_model.parameters() if p.requires_grad):.1f} M"
     )
     accelerator.print(
         f"Total batch size: {args.batch_size * accelerator.num_processes * args.accumulation_steps} ",
@@ -496,11 +626,28 @@ def main():
     accelerator.print(f"Total number of training samples: {len(train_dataset)}")
     accelerator.print(f"Total number of validation samples: {len(val_dataset)}")
 
-    if accelerator.is_main_process and args.log_dir:
-        writer = SummaryWriter(log_dir=args.log_dir)
+    # Generate or use provided experiment name
+    if accelerator.is_main_process:
+        if args.exp_name:
+            exp_name = args.exp_name
+        else:
+            model_name = args.model.split("/")[-1]
+            effective_batch = (
+                args.batch_size * args.accumulation_steps * accelerator.num_processes
+            )
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            exp_name = f"{model_name}_{args.score_type}_lr{args.peak_lr}_bs{effective_batch}__{timestamp}"
+
+        jsonl_log_path = os.path.join(args.output_dir, "training_log.jsonl")
+        tensorboard_dir = os.path.join(args.log_dir, exp_name) if args.log_dir else None
+
+        writer = CompositeWriter(log_dir=tensorboard_dir, jsonl_path=jsonl_log_path)
+
+        accelerator.print(f"Experiment name: {exp_name}")
+        accelerator.print(f"TensorBoard logs: {tensorboard_dir}")
+
     else:
-        accelerator.print("Not using TensorBoard logging, as log_dir is not set.")
-        writer = FakeWriter()
+        writer = CompositeWriter(log_dir=None, jsonl_path=None)
 
     train_loader_iter = iter(train_dataloader)
     os.makedirs(args.output_dir, exist_ok=True)
@@ -508,6 +655,7 @@ def main():
     if not os.path.exists(os.path.join(args.output_dir, "args.yaml")):
         with open(os.path.join(args.output_dir, "args.yaml"), "w") as f:
             yaml.dump(args_dict, f)
+    scoring_model.train()
     for j in tqdm.tqdm(
         range(start_step + 1, args.max_steps + 1),
         disable=not accelerator.is_main_process,
@@ -522,9 +670,7 @@ def main():
                 outputs = scoring_model(batch)
                 loss = outputs["loss"]
             accelerator.backward(loss / args.accumulation_steps)
-            loss = (
-                accelerator.gather(loss.detach()).mean().item()
-            )
+            loss = accelerator.gather(loss.detach()).mean().item()
             train_loss += loss / args.accumulation_steps
         train_count += 1
         grad_norm = accelerator.clip_grad_norm_(
@@ -535,7 +681,7 @@ def main():
         optimizer.zero_grad(set_to_none=True)
 
         if accelerator.is_main_process:
-            writer.add_scalar("Loss/train_loss", loss, j)
+            writer.add_scalar("Loss/train_loss", train_loss / train_count, j)
             writer.add_scalar(f"Loss/train_loss_{args.score_type}", loss, j)
             writer.add_scalar("Learning Rate", optimizer.param_groups[0]["lr"], j)
             writer.add_scalar(
@@ -545,129 +691,21 @@ def main():
             writer.add_scalar("Loss/Grad Norm", grad_norm, j)
 
         if j % args.val_steps == 0:
-            val_loss = 0
-            val_count = 0
-            all_val_annotations = []
-            all_val_predictions = []
-            all_val_params = []
 
-            all_val_variance_annotations = []
-            all_val_variance_predictions = []
+            scoring_model.eval()
 
-            with torch.no_grad():
-                for val_batch in tqdm.tqdm(
-                    val_dataloader, disable=not accelerator.is_main_process
-                ):
-                    with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-                        val_outputs = scoring_model(val_batch)
-                        loss = val_outputs["loss"]
-                    loss = accelerator.gather(loss).mean()
-                    val_loss += loss.item()
-                    val_count += 1
+            logging_dict = {"step": j, "train_loss": round(train_loss / train_count, 6)}
 
-                    val_annotation = val_batch["average_labels"]
-                    val_prediction = val_outputs["prob1"]
-                    all_val_annotations.extend(val_annotation.cpu().tolist())
-                    all_val_predictions.extend(val_prediction.cpu().tolist())
-                    all_val_params.extend(val_outputs["params"].cpu().tolist())
-
-                    if "label_variance" in val_batch:
-                        val_variance_annotation = val_batch["label_variance"]
-                        val_variance_prediction = val_outputs["variance"]
-                        all_val_variance_annotations.extend(
-                            val_variance_annotation.cpu().tolist()
-                        )
-                        all_val_variance_predictions.extend(
-                            val_variance_prediction.cpu().tolist()
-                        )
-                    metrics_to_sync = torch.tensor([val_loss, val_count], device=device)
-                    metrics_to_sync = accelerator.gather(metrics_to_sync)
-                    val_loss = metrics_to_sync[0].sum().item()
-                    val_count = metrics_to_sync[1].sum().item()
-
-                with open(
-                    os.path.join(
-                        args.output_dir,
-                        f"val_predictions_{j}_{accelerator.process_index}.yaml",
-                    ),
-                    "w",
-                ) as f:
-                    yaml.dump(
-                        {
-                            "predictions": all_val_predictions,
-                            "annotations": all_val_annotations,
-                            "params": all_val_params,
-                            "predictions_variance": all_val_variance_predictions,
-                            "annotations_variance": all_val_variance_annotations,
-                        },
-                        f,
-                    )
-                    accelerator.wait_for_everyone()
-
-            all_val_annotations = []
-            all_val_predictions = []
-            all_val_params = []
-            all_val_variance_annotations = []
-            all_val_variance_predictions = []
-            for i in range(accelerator.num_processes):
-                with open(
-                    os.path.join(args.output_dir, f"val_predictions_{j}_{i}.yaml"), "r"
-                ) as f:
-                    result_data = yaml.safe_load(f)
-                    all_val_annotations.extend(result_data["annotations"])
-                    all_val_predictions.extend(result_data["predictions"])
-                    all_val_params.extend(result_data["params"])
-                    all_val_variance_annotations.extend(result_data["annotations_variance"])
-                    all_val_variance_predictions.extend(result_data["predictions_variance"])
-
-            # Calculate Kendall's tau and Spearman's rank correlation
-            kendall_tau = kendalltau(all_val_annotations, all_val_predictions)
-            spearman_corr = spearmanr(all_val_annotations, all_val_predictions)
-
-            variance_kendall_tau = kendalltau(
-                all_val_variance_annotations, all_val_variance_predictions
+            spearman_corr, logging_dict = evaluate(
+                scoring_model,
+                val_dataloader,
+                accelerator,
+                logging_dict,
+                j,
+                writer,
+                best_val_rho,
+                args,
             )
-            variance_spearman_corr = spearmanr(
-                all_val_variance_annotations, all_val_variance_predictions
-            )
-
-            if accelerator.is_main_process:
-                writer.add_scalar("Loss/val_loss_mean", val_loss / val_count, j)
-                writer.add_scalar(
-                    f"Loss/val_loss_mean_{args.score_type}", val_loss / val_count, j
-                )
-                writer.add_scalar(
-                    "Correlations/Mean Kendall's Tau", float(kendall_tau.statistic), j
-                )
-                writer.add_scalar(
-                    "Correlations/Mean Spearman's Rank Correlation",
-                    float(spearman_corr.statistic),
-                    j,
-                )
-                writer.add_scalar(
-                    "Correlations/Variance Kendall's Tau",
-                    float(variance_kendall_tau.statistic),
-                    j,
-                )
-                writer.add_scalar(
-                    "Correlations/Variance Spearman's Rank Correlation",
-                    float(variance_spearman_corr.statistic),
-                    j,
-                )
-
-            logging_dict = {
-                "step": j,
-                "train_loss": train_loss / train_count,
-                "val_loss": val_loss / val_count,
-                "best_val_rho": best_val_rho
-                if best_val_rho > float(spearman_corr.statistic)
-                else float(spearman_corr.statistic),
-                "variance_tau": float(variance_kendall_tau.statistic),
-                "variance_rho": float(variance_spearman_corr.statistic),
-                "mean_tau": float(kendall_tau.statistic),
-                "mean_rho": float(spearman_corr.statistic),
-            }
-            accelerator.print(logging_dict)
             all_metrics.append(logging_dict)
             if float(spearman_corr.statistic) > best_val_rho:
                 best_val_rho = float(spearman_corr.statistic)
@@ -700,6 +738,8 @@ def main():
                 args=args,
                 tokenizer=tokenizer,
             )
+
+        scoring_model.train()
 
         recent_val_rho = [
             m["mean_rho"] for m in all_metrics[-args.early_stopping_patience :]
