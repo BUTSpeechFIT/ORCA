@@ -72,7 +72,11 @@ def beta_llh(params, labels, eps=1e-2):
     params = params.exp()
     concentration1 = params[:, 0]
     concentration0 = params[:, 1]
-    beta_distribution = torch.distributions.Beta(concentration1.unsqueeze(-1), concentration0.unsqueeze(-1))
+    try:
+        beta_distribution = torch.distributions.Beta(concentration1.unsqueeze(-1), concentration0.unsqueeze(-1))
+    except ValueError:
+        import ipdb; ipdb.set_trace()
+
     if labels is not None:
         labels = labels.clamp(min=eps, max=1 - eps)  # Avoid infs in the beta pdf
         log_probs = beta_distribution.log_prob(labels.float())
@@ -155,10 +159,10 @@ def bernoulli_params_kl(params_p, params_q):
     return kl_divergence.to(original_dtype)
 
 
-class Meme(torch.nn.Module):
+class ORCA(torch.nn.Module):
     def __init__(self, lm, score_type='bernoulli', layers_to_use=(-1,), use_cls_token=False):
         """
-        Initialize the ORCA model.
+        Initialize the ORCA model (formerly MEME).
         :param lm: pre-trained language model (e.g., Gemma, Llama, etc.)
         :param score_type: Type of scoring function to use, either 'bernoulli' or 'beta'.
         :param layers_to_use: List of layer concatenate as input to the scorer. If None, all layers will be used.

@@ -12,11 +12,11 @@ from torch.utils.data import DataLoader
 from transformers import (AutoModel, AutoModelForCausalLM, AutoTokenizer,
                           BitsAndBytesConfig)
 
-import data_meme
-import meme_model
+from orca_score import data, model
 
 
-def main():
+def parse_arguments():
+
     parser = argparse.ArgumentParser(description="ORCA Inference Script",
                                      formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument('--batch_size', type=int, default=4,
@@ -25,29 +25,31 @@ def main():
                         help='Number of workers for DataLoader')
 
     parser.add_argument('--tokenizer_path', type=str,
-                        help="Path to the tokenizer directory. "
-                             "This is there for backward compatibility as I wasn't saving the tokenizer earlier on.")
+                        help="Path to the tokenizer directory.")
     parser.add_argument('--test_set_is_labeled', action='store_true',
-                        help='If set, the test set is assumed to be labeled. '
-                             'This is used to decide whether to compute Kendall Tau and Spearman correlation scores.')
+                        help='If set, the test set is assumed to be labeled.')
     parser.add_argument('--skip_rationale', action='store_true',
-                        help='If set, the model will not use rationales for scoring. '
-                             'This may be useful for training on datasets without rationales.')
+                        help='If set, the model will not use rationales for scoring.')
     parser.add_argument('--skip_question', action='store_true',
-                        help='If set, the model will not use questions for scoring. '
-                             'This is mostly for analysis.')
+                        help='If set, the model will not use questions for scoring.')
     parser.add_argument('--add_transcript', action='store_true',
                         help='If set, the model will use transcript as additional context.')
 
-    parser.add_argument('--meme_model_path', type=str,
-                        default='/mnt/matylda5/iyusuf/exps/better_score/models//lean_meme-context-beta-train_human-val_M1_6_M2_5-model_gemma12bit_lora256/best/model',
-                        help='Path to the trained Meme model directory')
+    parser.add_argument('--model_path', type=str, required=True,
+                        help='Path to the trained ORCA model directory')
     parser.add_argument('--data', type=str, required=True,
                         help='Path to the json file containing the data to score.')
-    parser.add_argument('--output_dir', type=str, default='meme_inference_output',
+    parser.add_argument('--output_dir', type=str, default='orca_inference_output',
                         help='Directory to save inference results')
 
     args = parser.parse_args()
+
+    return args
+
+
+def main():
+
+    args = parse_arguments()
 
     accelerator = accelerate.Accelerator()
     device = accelerator.device
@@ -59,59 +61,57 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     if args.test_set_is_labeled:
-        inference_data = data_meme.UnifiedAnnotationDataset(args.data,
-                                                            skip_question=args.skip_question,
-                                                            skip_rationale=args.skip_rationale,
-                                                            add_transcript=args.add_transcript,
-                                                            )
+        inference_data = data.UnifiedAnnotationDataset(args.data,
+                                                       skip_question=args.skip_question,
+                                                       skip_rationale=args.skip_rationale,
+                                                       add_transcript=args.add_transcript)
     else:
-        inference_data = data_meme.InferenceDataset(args.data,
-                                                    skip_question=args.skip_question,
-                                                    skip_rationale=args.skip_rationale,
-                                                    add_transcript=args.add_transcript,
-                                                    )
+        inference_data = data.InferenceDataset(args.data,
+                                               skip_question=args.skip_question,
+                                               skip_rationale=args.skip_rationale,
+                                               add_transcript=args.add_transcript)
 
-    # Load the Meme model
-    if os.path.isfile(os.path.join(args.meme_model_path, 'lm', 'adapter_config.json')):
-        base_model_name = json.load(open(os.path.join(args.meme_model_path, 'lm', 'adapter_config.json'))
+    # Load the ORCA model
+    if os.path.isfile(os.path.join(args.model_path, 'lm', 'adapter_config.json')):
+        base_model_name = json.load(open(os.path.join(args.model_path, 'lm', 'adapter_config.json'))
                                     )['base_model_name_or_path']
         lm = AutoModelForCausalLM.from_pretrained(
             base_model_name,
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
             device_map=device.type,
             low_cpu_mem_usage=True,
         )
         lm = PeftModel.from_pretrained(
             lm,
-            os.path.join(args.meme_model_path, 'lm',),
+            os.path.join(args.model_path, 'lm'),
             low_cpu_mem_usage=True,
         )
         lm = lm.merge_and_unload()
     else:
         lm = AutoModel.from_pretrained(
-            os.path.join(args.meme_model_path, 'lm'),
+            os.path.join(args.model_path, 'lm'),
             device_map=device.type,
             low_cpu_mem_usage=True,
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
         )
     if args.tokenizer_path:
         tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
     else:
         tokenizer = AutoTokenizer.from_pretrained(
-            os.path.join(os.path.dirname(args.meme_model_path), 'tokenizer'),
+            os.path.join(os.path.dirname(args.model_path), 'tokenizer'),
         )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    scoring_model = meme_model.Meme.load_from_directory(args.meme_model_path, lm=lm, device=device)
+    scoring_model = model.ORCA.load_from_directory(args.model_path, lm=lm, device=device)
 
-    collate_fn = data_meme.CollateFn(tokenizer)
+    collate_fn = data.CollateFn(tokenizer)
     inference_loader = DataLoader(
         inference_data,
         batch_size=args.batch_size,
         collate_fn=collate_fn,
         shuffle=False,
-        num_workers=2,
+        num_workers=args.num_workers,
     )
 
     scoring_model.eval()
@@ -121,8 +121,8 @@ def main():
         all_params = []
         all_prob1 = []
         all_variance = []
-        all_ratings = []  # Only used if test_set_is_labeled is True
-        all_ground_truth_variances = []  # Only used if test_set_is_labeled is True
+        all_ratings = []
+        all_ground_truth_variances = []
         for batch in tqdm.tqdm(inference_loader, desc="Inference"):
             with torch.autocast(device.type, dtype=torch.bfloat16):
                 outputs = scoring_model(batch)
@@ -141,9 +141,9 @@ def main():
         # Save results
         result = {
             'params': all_params,
-            'rating_meme': all_prob1,
+            'rating_orca': all_prob1,
             'idx': all_idxs,
-            'variance_meme': all_variance,
+            'variance_orca': all_variance,
         }
         if args.test_set_is_labeled:
             result['rating_ground_truth'] = all_ratings
@@ -157,25 +157,25 @@ def main():
         all_params = []
         all_prob1 = []
         all_variance = []
-        all_ratings = []  # Only used if test_set_is_labeled is True
-        all_ground_truth_variances = []  # Only used if test_set_is_labeled is True
+        all_ratings = []
+        all_ground_truth_variances = []
         for i in range(accelerator.num_processes):
             output_file = os.path.join(args.output_dir, f"result_{i}.yaml")
             with open(output_file, 'r') as f:
                 result = yaml.load(f, Loader=yaml.FullLoader)
             all_idxs.extend(result['idx'])
             all_params.extend(result['params'])
-            all_prob1.extend(result['rating_meme'])
-            all_variance.extend(result['variance_meme'])
+            all_prob1.extend(result['rating_orca'])
+            all_variance.extend(result['variance_orca'])
             if args.test_set_is_labeled:
                 all_ratings.extend(result['rating_ground_truth'])
                 all_ground_truth_variances.extend(result['variance_ground_truth'])
 
         final_result = {
             'params': all_params,
-            'rating_meme': all_prob1,
+            'rating_orca': all_prob1,
             'idx': all_idxs,
-            'variance_meme': all_variance,
+            'variance_orca': all_variance,
         }
         if args.test_set_is_labeled:
             final_result['rating_ground_truth'] = all_ratings
@@ -184,8 +184,8 @@ def main():
         for idx, param, prob1, variance in zip(all_idxs, all_params, all_prob1, all_variance):
             final_result_indexed_by_idx[idx] = {
                 'param': param,
-                'rating_meme': prob1,
-                'variance_meme': variance,
+                'rating_orca': prob1,
+                'variance_orca': variance,
             }
             if args.test_set_is_labeled:
                 final_result_indexed_by_idx[idx]['rating_ground_truth'] = all_ratings[all_idxs.index(idx)]
@@ -208,7 +208,6 @@ def main():
                 'rating_spearman_correlation': float(spearman_corr),
             }
             if scoring_model.score_type == 'beta':
-                # Variance metrics only make sense for beta
                 variance_tau, _ = kendalltau(all_ground_truth_variances, all_variance)
                 variance_spearman_corr, _ = spearmanr(all_ground_truth_variances, all_variance)
                 print(f"Variance Kendall Tau: {variance_tau}")

@@ -6,22 +6,18 @@ import accelerate
 import torch
 import tqdm
 import yaml
+from peft import LoraConfig, PeftModel, get_peft_model
 from scipy.stats import kendalltau, spearmanr
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from transformers import (
-    AutoModel,
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    BitsAndBytesConfig,
-)
+from transformers import (AutoModel, AutoModelForCausalLM, AutoTokenizer,
+                          BitsAndBytesConfig)
 
-import data_meme
-import meme_model
+from orca_score import data, model
 
 
 def save_checkpoint(
-    model,
+    scoring_model,
     output_dir,
     accelerator=None,
     optimizer=None,
@@ -34,9 +30,9 @@ def save_checkpoint(
     """
     os.makedirs(output_dir, exist_ok=True)
     if accelerator is None:
-        model.save_to_directory(os.path.join(output_dir, "model"))
+        scoring_model.save_to_directory(os.path.join(output_dir, "model"))
     else:
-        accelerator.unwrap_model(model).save_to_directory(
+        accelerator.unwrap_model(scoring_model).save_to_directory(
             os.path.join(output_dir, "model")
         )
     if optimizer is not None:
@@ -76,33 +72,30 @@ class FakeWriter:
         pass
 
 
-def main():
+def parse_arguments():
+
     parser = argparse.ArgumentParser(
-        description="Train a model on the MMAU dataset.",
+        description="Train ORCA model.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "--train_data",
         type=str,
         nargs="+",
-        default=[
-            "/mnt/matylda4/kesiraju/tools/potato/data_splits_for_meme/M1_6_M2_5/train_human.json",
-            "/mnt/matylda4/kesiraju/tools/potato/data_splits_for_meme/M1_6_M2_5/train_llmj_p1.json",
-        ],
+        required=True,
         help="Paths to training data files. Can be multiple files for different splits.",
     )
     parser.add_argument(
         "--val_data",
         type=str,
-        default="/mnt/matylda4/kesiraju/tools/potato/data_splits_for_meme/M1_6_M2_5/val_human.json",
-        help="Paths to human data files for training.",
+        required=True,
+        help="Path to validation data file.",
     )
     parser.add_argument(
         "--max_data_length",
         type=int,
         default=1000,
-        help="Maximum length of input text in characters. Avoids OOM errors for some rather loquacious "
-        "models/judges.",
+        help="Maximum length of input text in characters.",
     )
     parser.add_argument(
         "--dataset_sampling_weights",
@@ -115,14 +108,12 @@ def main():
     parser.add_argument(
         "--skip_rationale",
         action="store_true",
-        help="If set, the model will not use rationales for scoring. "
-        "This may be useful for training on datasets without rationales.",
+        help="If set, the model will not use rationales for scoring.",
     )
     parser.add_argument(
         "--skip_question",
         action="store_true",
-        help="If set, the model will not use questions for scoring. "
-        "This is mostly for analysis.",
+        help="If set, the model will not use questions for scoring.",
     )
     parser.add_argument(
         "--add_transcript",
@@ -134,14 +125,14 @@ def main():
         "--prompts_yaml",
         type=str,
         default=None,
-        help="Path to YAML file with prompts for the model. If not provided, no prompts will be used.",
+        help="Path to YAML file with prompts for the model.",
     )
     parser.add_argument(
         "--score_type",
         type=str,
-        default="bernoulli",
+        default="beta",
         choices=["bernoulli", "beta", "mse", "bmm"],
-        help='Type of scoring to use for the model. Options are "bernoulli" or "beta".',
+        help='Type of scoring to use for training the model.',
     )
     parser.add_argument(
         "--model",
@@ -159,7 +150,7 @@ def main():
         nargs="+",
         type=int,
         default=None,
-        help="List of layer indices to use for scoring. If not provided, all layers will be used. ",
+        help="List of layer indices to use for scoring. If not provided, all layers will be used.",
     )
 
     parser.add_argument("--lora_rank", type=int, help="LoRA rank, default is no LoRA")
@@ -168,7 +159,7 @@ def main():
         type=str,
         default="none",
         choices=["none", "4bit", "8bit"],
-        help="Quantization level to use for the model. Default is no quantization.",
+        help="Quantization level to use for the model.",
     )
     parser.add_argument(
         "--use_cls_token",
@@ -185,7 +176,7 @@ def main():
         "--load_checkpoint",
         type=str,
         default=None,
-        help="Path to a checkpoint to load the model from. If provided, the model will be loaded from this checkpoint ",
+        help="Path to a checkpoint to load the model from.",
     )
     parser.add_argument(
         "--resume",
@@ -194,7 +185,7 @@ def main():
     )
 
     parser.add_argument(
-        "--max_steps", type=int, default=4000, help="Number of epochs to train."
+        "--max_steps", type=int, default=4000, help="Number of training steps."
     )
     parser.add_argument(
         "--val_steps", type=int, default=100, help="Number of steps between validation."
@@ -209,7 +200,7 @@ def main():
         "--accumulation_steps",
         type=int,
         default=4,
-        help="Number of gradient accumulation steps. Useful for large models with small batch sizes.",
+        help="Number of gradient accumulation steps.",
     )
     parser.add_argument(
         "--warmup_steps",
@@ -233,6 +224,7 @@ def main():
         "--max_grad_norm",
         type=float,
         default=5.0,
+        help="Maximum gradient norm for clipping.",
     )
 
     parser.add_argument(
@@ -265,6 +257,13 @@ def main():
     )
 
     args = parser.parse_args()
+
+    return args
+
+
+def main():
+
+    args = parse_arguments()
 
     ddp_kwarg_handler = accelerate.utils.DistributedDataParallelKwargs(
         find_unused_parameters=True
@@ -306,9 +305,6 @@ def main():
             low_cpu_mem_usage=True,
         )
 
-    # if hasattr(lm, 'model'):
-    #     # Remove the classification head if it exists
-    #     lm = lm.model
     if args.tokenizer is not None:
         tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
     else:
@@ -318,7 +314,6 @@ def main():
 
     tokenizer.padding_side = "left"
 
-    from peft import LoraConfig, PeftModel, get_peft_model
 
     if args.lora_rank is not None and not args.load_checkpoint:
         lora_config = LoraConfig(
@@ -329,7 +324,7 @@ def main():
         )
         lm = get_peft_model(lm, lora_config)
 
-    scoring_model = meme_model.Meme(
+    scoring_model = model.ORCA(
         lm,
         score_type=args.score_type,
         layers_to_use=args.layers_to_use,
@@ -341,11 +336,11 @@ def main():
     else:
         prompts = None
 
-    collate_fn = data_meme.CollateFn(tokenizer)
+    collate_fn = data.CollateFn(tokenizer)
     if args.dataset_sampling_weights is None:
-        train_dataset = data_meme.ConcatenatedDataset(
+        train_dataset = data.ConcatenatedDataset(
             [
-                data_meme.UnifiedAnnotationDataset(
+                data.UnifiedAnnotationDataset(
                     jfile,
                     prompts=prompts,
                     filter_func=lambda x: len(x["text"]) <= args.max_data_length,
@@ -365,7 +360,7 @@ def main():
         )
     else:
         train_datasets = [
-            data_meme.UnifiedAnnotationDataset(
+            data.UnifiedAnnotationDataset(
                 jfile,
                 prompts=prompts,
                 filter_func=lambda x: len(x["text"]) <= args.max_data_length,
@@ -386,7 +381,7 @@ def main():
             )
             for train_dataset in train_datasets
         ]
-        train_dataset = data_meme.DatasetWithSampling(
+        train_dataset = data.DatasetWithSampling(
             train_dataloaders, sampling_weights=args.dataset_sampling_weights
         )
         train_dataloader = DataLoader(
@@ -397,7 +392,7 @@ def main():
             collate_fn=lambda x: x[0],
         )
 
-    val_dataset = data_meme.UnifiedAnnotationDataset(
+    val_dataset = data.UnifiedAnnotationDataset(
         args.val_data,
         prompts=prompts,
         skip_rationale=args.skip_rationale,
@@ -431,7 +426,7 @@ def main():
                 attn_implementation=attn_impl,
             )
             accelerator.print("Loaded LM model from checkpoint")
-        scoring_model = meme_model.Meme.load_from_directory(
+        scoring_model = model.ORCA.load_from_directory(
             args.load_checkpoint, lm, device=device
         )
     if args.resume:
@@ -443,11 +438,11 @@ def main():
         else:
             lm = AutoModel.from_pretrained(
                 os.path.join(latest_checkpoint, "lm"),
-                dtype=torch.bfloat16,
+                torch_dtype=torch.bfloat16,
                 attn_implementation=attn_impl,
             )
             accelerator.print("Loaded LM model from checkpoint")
-        scoring_model = meme_model.Meme.load_from_directory(
+        scoring_model = model.ORCA.load_from_directory(
             latest_checkpoint, lm, device=device
         )
         with open(os.path.join(latest_checkpoint, "metrics.yaml"), "r") as f:
@@ -524,16 +519,12 @@ def main():
                 train_loader_iter = iter(train_dataloader)
                 batch = next(train_loader_iter)
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-                outputs = scoring_model(batch)  # ,
-                # prior_params=torch.tensor([[0., 0.]]).to(device),)
-                # outputs = torch.utils.checkpoint.checkpoint(
-                #     scoring_model, batch, use_reentrant=False,
-                # )
+                outputs = scoring_model(batch)
                 loss = outputs["loss"]
             accelerator.backward(loss / args.accumulation_steps)
             loss = (
                 accelerator.gather(loss.detach()).mean().item()
-            )  # Average loss across all processes
+            )
             train_loss += loss / args.accumulation_steps
         train_count += 1
         grad_norm = accelerator.clip_grad_norm_(
@@ -622,12 +613,12 @@ def main():
                 with open(
                     os.path.join(args.output_dir, f"val_predictions_{j}_{i}.yaml"), "r"
                 ) as f:
-                    data = yaml.safe_load(f)
-                    all_val_annotations.extend(data["annotations"])
-                    all_val_predictions.extend(data["predictions"])
-                    all_val_params.extend(data["params"])
-                    all_val_variance_annotations.extend(data["annotations_variance"])
-                    all_val_variance_predictions.extend(data["predictions_variance"])
+                    result_data = yaml.safe_load(f)
+                    all_val_annotations.extend(result_data["annotations"])
+                    all_val_predictions.extend(result_data["predictions"])
+                    all_val_params.extend(result_data["params"])
+                    all_val_variance_annotations.extend(result_data["annotations_variance"])
+                    all_val_variance_predictions.extend(result_data["predictions_variance"])
 
             # Calculate Kendall's tau and Spearman's rank correlation
             kendall_tau = kendalltau(all_val_annotations, all_val_predictions)

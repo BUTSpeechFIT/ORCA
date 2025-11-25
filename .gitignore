@@ -1,0 +1,7 @@
+exp/
+data/
+*.*~
+__pycache__
+*.sh
+
+orca-env/

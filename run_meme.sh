@@ -27,10 +27,10 @@ MODELS_DIR=/mnt/matylda5/iyusuf/exps/better_score/tacl/models/
 mkdir -p $TENSORBOARD_DIR
 mkdir -p $MODELS_DIR
 
-cd /mnt/matylda5/iyusuf/exps/better_score || {
-    echo "No such directory /mnt/matylda5/iyusuf/exps/better_score"
-    exit 1
-}
+# cd /mnt/matylda5/iyusuf/exps/better_score || {
+#     echo "No such directory /mnt/matylda5/iyusuf/exps/better_score"
+#     exit 1
+# }
 args=(
     # General training arguments
     # Training arguments
