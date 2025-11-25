@@ -10,7 +10,7 @@ authors = [
 ]
 dependencies = [
     "torch",
-    "transformers",
+    "transformers==4.57.1",  # works with offline models and tokenizers
     "accelerate",
     "peft",
     "scipy",
@@ -27,6 +27,8 @@ dev = [
     "ruff",
     "isort",
     "ipdb",
+    "ipython",
+    "huggingface_hub[cli]",
 ]
 
 [project.scripts]
