@@ -1,7 +1,10 @@
-exp/
-data/
+exp
+data
+.cache
+
 *.*~
-__pycache__
 *.sh
 
-orca-env/
+__pycache__
+
+.venv
