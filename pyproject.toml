@@ -29,6 +29,7 @@ dev = [
     "ipdb",
     "ipython",
     "huggingface_hub[cli]",
+    "pre-commit",
 ]
 
 [project.scripts]
