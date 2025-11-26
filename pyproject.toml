@@ -11,7 +11,7 @@ authors = [
 dependencies = [
     "torch",
     "transformers==4.57.1",  # works with offline models and tokenizers
-    "accelerate",
+    "accelerate==1.12.0",
     "peft",
     "scipy",
     "pyyaml",
@@ -30,6 +30,7 @@ dev = [
     "ipython",
     "huggingface_hub[cli]",
     "pre-commit",
+    "matplotlib",
 ]
 
 [project.scripts]

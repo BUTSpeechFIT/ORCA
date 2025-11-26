@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🐋 ORCA - Open-ended Response Correctness Assessment</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+        }
+
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
+            padding: 40px 20px;
+        }
+
+        .card {
+            background: white;
+            border-radius: 12px;
+            padding: 40px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            margin-bottom: 30px;
+        }
+
+        header {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+
+        h1 {
+            font-size: 2.5em;
+            color: #667eea;
+            margin-bottom: 10px;
+        }
+
+        .subtitle {
+            font-size: 1.2em;
+            color: #666;
+            margin-bottom: 20px;
+        }
+
+        .status {
+            display: inline-block;
+            background: #fef3c7;
+            color: #92400e;
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-size: 0.9em;
+            font-weight: 500;
+        }
+
+        .authors {
+            margin: 30px 0;
+            font-size: 0.95em;
+            line-height: 1.8;
+        }
+
+        .affiliations {
+            font-size: 0.85em;
+            color: #666;
+            margin-top: 15px;
+        }
+
+        .coming-soon {
+            background: #e0e7ff;
+            border-left: 4px solid #667eea;
+            padding: 20px;
+            margin: 30px 0;
+            border-radius: 6px;
+        }
+
+        .coming-soon h3 {
+            color: #667eea;
+            margin-bottom: 15px;
+        }
+
+        .coming-soon ul {
+            list-style: none;
+            padding-left: 0;
+        }
+
+        .coming-soon li {
+            padding: 8px 0;
+            font-size: 1.05em;
+        }
+
+        .features {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 20px;
+            margin: 30px 0;
+        }
+
+        .feature {
+            background: #f8fafc;
+            padding: 20px;
+            border-radius: 8px;
+            border: 1px solid #e2e8f0;
+        }
+
+        .feature h3 {
+            color: #667eea;
+            margin-bottom: 10px;
+            font-size: 1.1em;
+        }
+
+        .buttons {
+            display: flex;
+            gap: 15px;
+            justify-content: center;
+            margin: 30px 0;
+            flex-wrap: wrap;
+        }
+
+        .btn {
+            display: inline-block;
+            padding: 12px 30px;
+            text-decoration: none;
+            border-radius: 6px;
+            font-weight: 500;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+        }
+
+        .btn-primary {
+            background: #667eea;
+            color: white;
+        }
+
+        .btn-secondary {
+            background: #48bb78;
+            color: white;
+        }
+
+        .btn-tertiary {
+            background: #ed8936;
+            color: white;
+        }
+
+        code {
+            background: #f1f5f9;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-family: 'Courier New', monospace;
+            font-size: 0.9em;
+        }
+
+        pre {
+            background: #1e293b;
+            color: #e2e8f0;
+            padding: 20px;
+            border-radius: 6px;
+            overflow-x: auto;
+            margin: 20px 0;
+        }
+
+        pre code {
+            background: none;
+            padding: 0;
+            color: #e2e8f0;
+        }
+
+        .architecture {
+            text-align: center;
+            margin: 30px 0;
+            padding: 20px;
+            background: #f8fafc;
+            border-radius: 8px;
+        }
+
+        footer {
+            text-align: center;
+            color: white;
+            padding: 20px;
+            font-size: 0.9em;
+        }
+
+        footer a {
+            color: white;
+            text-decoration: underline;
+        }
+
+        h2 {
+            color: #667eea;
+            margin: 30px 0 20px 0;
+            font-size: 1.8em;
+        }
+
+        @media (max-width: 768px) {
+            h1 {
+                font-size: 2em;
+            }
+
+            .card {
+                padding: 20px;
+            }
+
+            .buttons {
+                flex-direction: column;
+            }
+
+            .btn {
+                width: 100%;
+                text-align: center;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="card">
+            <header>
+                <h1>🐋 ORCA</h1>
+                <p class="subtitle">Open-ended Response Correctness Assessment for Audio Question Answering</p>
+                <div class="status">📄 Under Review at TACL</div>
+            </header>
+
+            <div class="authors">
+                <strong>Authors:</strong><br>
+                Šimon Sedláček¹*, Sara Barahona²*, Bolaji Yusuf¹*, Laura Herrera-Alarcón²*, Santosh Kesiraju¹*,
+                Cecilia Bolaños³, Alicia Lozano-Diez², Sathvik Udupa¹, Fernando López²,
+                Allison Ferner⁴, Ramani Duraiswami⁵, Jan Černocký¹
+                <br><small>* Equal contribution</small>
+
+                <div class="affiliations">
+                    ¹ Speech@FIT, Brno University of Technology, Czechia<br>
+                    ² Universidad Autónoma de Madrid, Spain<br>
+                    ³ University of Buenos Aires, Argentina<br>
+                    ⁴ Tufts University, USA<br>
+                    ⁵ University of Maryland, USA
+                </div>
+            </div>
+
+            <p style="font-size: 1.1em; margin: 20px 0;">
+                ORCA is a framework for assessing the quality of open-ended responses in audio question-answering tasks.
+                It uses language model representations with Beta distribution modeling to capture both the mean quality
+                and uncertainty (variance) of responses based on multiple human annotations.
+            </p>
+
+            <div class="coming-soon">
+                <h3>🚀 Coming Soon</h3>
+                <ul>
+                    <li>🤗 <strong>Pre-trained models</strong> on HuggingFace</li>
+                    <li>📊 <strong>Training datasets</strong> with 11,721 human annotations</li>
+                    <li>🏆 <strong>ORCA-based leaderboard</strong> for audio QA model evaluation</li>
+                </ul>
+            </div>
+
+            <div class="buttons">
+                <a href="https://github.com/BUTSpeechFIT/Orca" class="btn btn-primary" target="_blank">
+                    📦 GitHub Repository
+                </a>
+                <a href="https://github.com/BUTSpeechFIT/Orca#citation" class="btn btn-secondary" target="_blank">
+                    📚 Citation
+                </a>
+                <a href="mailto:kesiraju@fit.vut.cz" class="btn btn-tertiary">
+                    ✉️ Contact
+                </a>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>✨ Key Features</h2>
+            <div class="features">
+                <div class="feature">
+                    <h3>🎯 Multiple Scoring Functions</h3>
+                    <p>Support for Bernoulli, Beta NLL, Beta Moment Matching (BMM), and MSE loss functions.</p>
+                </div>
+                <div class="feature">
+                    <h3>📊 Uncertainty Estimation</h3>
+                    <p>Models annotation variance using Beta distribution parameters (α, β) to capture disagreement.</p>
+                </div>
+                <div class="feature">
+                    <h3>⚡ Efficient Fine-tuning</h3>
+                    <p>Uses LoRA (Low-Rank Adaptation) for parameter-efficient training on large language models.</p>
+                </div>
+                <div class="feature">
+                    <h3>🔄 Distributed Training</h3>
+                    <p>Built on HuggingFace Accelerate for seamless multi-GPU training.</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>🏗️ Model Architecture</h2>
+            <div class="architecture">
+                <p style="margin-bottom: 20px;">
+                    ORCA uses a pre-trained language model (e.g., Gemma, Llama, OLMo) with a linear scoring head
+                    that outputs log(α) and log(β) parameters for a Beta distribution.
+                </p>
+                <div style="text-align: left; max-width: 600px; margin: 0 auto;">
+                    <strong>Beta Distribution captures:</strong>
+                    <ul style="margin-top: 10px; padding-left: 20px;">
+                        <li><strong>Mean quality:</strong> E[score] = α / (α + β)</li>
+                        <li><strong>Uncertainty/Variance:</strong> Var[score] = (α·β) / ((α+β)²·(α+β+1))</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>🚀 Quick Start</h2>
+
+            <h3 style="color: #667eea; margin-top: 20px;">Installation</h3>
+            <pre><code># Python 3.12+ required
+pip install -e .</code></pre>
+
+            <h3 style="color: #667eea; margin-top: 30px;">Training</h3>
+            <pre><code>python -m orca_score.train \
+    --train_data path/to/train.json \
+    --val_data path/to/val.json \
+    --model google/gemma-3-1b-it \
+    --score_type beta \
+    --lora_rank 256 \
+    --output_dir ./output \
+    --log_dir ./logs</code></pre>
+
+            <h3 style="color: #667eea; margin-top: 30px;">Inference</h3>
+            <pre><code>python -m orca_score.infer \
+    --model_path ./output/best \
+    --data path/to/test.json \
+    --output_dir ./results</code></pre>
+        </div>
+
+        <div class="card">
+            <h2>📖 Citation</h2>
+            <pre><code>@article{sedlacek2025orca,
+  title={ORCA: Open-ended Response Correctness Assessment for Audio Question Answering},
+  author={Sedl\'{a}\v{c}ek, \v{S}imon and Barahona, Sara and Yusuf, Bolaji and
+          Herrera-Alarc\'{o}n, Laura and Kesiraju, Santosh and Bola\~{n}os, Cecilia and
+          Lozano-Diez, Alicia and Udupa, Sathvik and L\'{o}pez, Fernando and
+          Ferner, Allison and Duraiswami, Ramani and \v{C}ernock\'{y}, Jan},
+  journal={Transactions of the Association for Computational Linguistics},
+  year={2025},
+  note={Under review}
+}</code></pre>
+        </div>
+
+        <div class="card">
+            <h2>📧 Contact</h2>
+            <p>For questions or issues, please contact the corresponding authors:</p>
+            <ul style="margin-top: 15px; padding-left: 20px;">
+                <li><strong>Šimon Sedláček</strong> - <a href="mailto:isedlacek@fit.vut.cz">isedlacek@fit.vut.cz</a></li>
+                <li><strong>Bolaji Yusuf</strong> - <a href="mailto:iyusuf@fit.vut.cz">iyusuf@fit.vut.cz</a></li>
+                <li><strong>Santosh Kesiraju</strong> - <a href="mailto:kesiraju@fit.vut.cz">kesiraju@fit.vut.cz</a></li>
+            </ul>
+        </div>
+    </div>
+
+    <footer>
+        <p>
+            © 2025 Speech@FIT, Brno University of Technology |
+            <a href="https://github.com/BUTSpeechFIT/Orca/blob/main/LICENSE" target="_blank">MIT License</a>
+        </p>
+    </footer>
+</body>
+</html>

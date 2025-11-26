@@ -1,3 +1,5 @@
+"""Author: Bolaji Yusuf, Santosh Kesiraju"""
+
 import os
 
 import torch
@@ -20,9 +22,7 @@ def bernoulli_kl(logits, labels):
         labels1 = labels.float()
         labels1_mask = labels1 >= 0
         labels1 = labels1.masked_fill(~labels1_mask, 0)
-        labels1 = labels1.sum(dim=-1, keepdim=True) / labels1_mask.sum(
-            dim=-1, keepdim=True
-        ).clamp(
+        labels1 = labels1.sum(dim=-1, keepdim=True) / labels1_mask.sum(dim=-1, keepdim=True).clamp(
             min=1e-8
         )  # Avoid division by zero
         labels0 = 1 - labels1
@@ -54,9 +54,7 @@ def mse_loss(logits, labels):
         labels1 = labels.float()
         labels1_mask = labels1 >= 0
         labels1 = labels1.masked_fill(~labels1_mask, 0)
-        labels1 = labels1.sum(dim=-1, keepdim=True) / labels1_mask.sum(
-            dim=-1, keepdim=True
-        ).clamp(
+        labels1 = labels1.sum(dim=-1, keepdim=True) / labels1_mask.sum(dim=-1, keepdim=True).clamp(
             min=1e-8
         )  # Avoid division by zero
         # labels0 = 1 - labels1
@@ -75,8 +73,8 @@ def beta_llh(params, labels, eps=1e-2):
     """
     Compute the log likelihood of the labels given the logits for a binary classification.
     :param params: Tensor of shape (batch_size, 2)
-    :param labels: Tensor of shape (batch_size,)
-    :return: Tensor of shape (batch_size,)
+    :param labels: Tensor of shape (batch_size, num_annotations) - padded with -100
+    :return: Tensor of shape (batch_size, num_annotations)
     """
     original_dtype = params.dtype
     params: torch.Tensor = params.float()
@@ -88,9 +86,14 @@ def beta_llh(params, labels, eps=1e-2):
         concentration1.unsqueeze(-1), concentration0.unsqueeze(-1)
     )
     if labels is not None:
-        labels = labels.clamp(min=eps, max=1 - eps)  # Avoid infs in the beta pdf
-        log_probs = beta_distribution.log_prob(labels.float())
+        # Create mask for valid labels (non-padded)
+        valid_mask = labels >= 0
+        # Clamp labels to valid range
+        labels_clamped = labels.clamp(min=eps, max=1 - eps)
+        log_probs = beta_distribution.log_prob(labels_clamped.float())
         negative_log_probs = -log_probs.to(original_dtype)
+        # Zero out padded positions
+        negative_log_probs = negative_log_probs * valid_mask.to(original_dtype)
     else:
         negative_log_probs = None
     return (
@@ -98,10 +101,9 @@ def beta_llh(params, labels, eps=1e-2):
         (concentration1 / (concentration1 + concentration0)).to(original_dtype),
         # (concentration1 - 1)/(concentration0 + concentration1 - 2).to(original_dtype),
         (concentration0 * concentration1)
-        / (
-            (concentration1 + concentration0 + 1)
-            * ((concentration1 + concentration0) ** 2)
-        ).to(original_dtype),
+        / ((concentration1 + concentration0 + 1) * ((concentration1 + concentration0) ** 2)).to(
+            original_dtype
+        ),
     )
 
 
@@ -129,8 +131,7 @@ def beta_moment_matching(params, labels, eps=1e-2):
         labels_variance = labels.var(dim=-1, unbiased=False)
         predicted_mean = concentration1 / (concentration1 + concentration0)
         predicted_variance = (concentration0 * concentration1) / (
-            (concentration1 + concentration0 + 1)
-            * ((concentration1 + concentration0) ** 2)
+            (concentration1 + concentration0 + 1) * ((concentration1 + concentration0) ** 2)
         )
         moments_difference = (predicted_mean - labels_mean) ** 2 + (
             predicted_variance - labels_variance
@@ -141,10 +142,9 @@ def beta_moment_matching(params, labels, eps=1e-2):
         moments_difference,
         (concentration1 / (concentration1 + concentration0)).to(original_dtype),
         (concentration0 * concentration1)
-        / (
-            (concentration1 + concentration0 + 1)
-            * ((concentration1 + concentration0) ** 2)
-        ).to(original_dtype),
+        / ((concentration1 + concentration0 + 1) * ((concentration1 + concentration0) ** 2)).to(
+            original_dtype
+        ),
     )
 
 
@@ -167,9 +167,7 @@ def beta_params_kl(params_p, params_q):
 
     beta_distribution_p = torch.distributions.Beta(concentration1_p, concentration0_p)
     beta_distribution_q = torch.distributions.Beta(concentration1_q, concentration0_q)
-    kl_divergence = torch.distributions.kl_divergence(
-        beta_distribution_p, beta_distribution_q
-    )
+    kl_divergence = torch.distributions.kl_divergence(beta_distribution_p, beta_distribution_q)
     return kl_divergence.to(original_dtype)
 
 
@@ -192,13 +190,19 @@ def bernoulli_params_kl(params_p, params_q):
 
 class ORCA(torch.nn.Module):
     def __init__(
-        self, lm, score_type="bernoulli", layers_to_use=(-1,), use_cls_token=False
+        self,
+        lm,
+        score_type="bernoulli",
+        layers_to_use=(-1,),
+        use_cls_token=False,
+        init_type="xavier",
     ):
         """
         Initialize the ORCA model (formerly MEME).
         :param lm: pre-trained language model (e.g., Gemma, Llama, etc.)
         :param score_type: Type of scoring function to use, either 'bernoulli' or 'beta'.
         :param layers_to_use: List of layer concatenate as input to the scorer. If None, all layers will be used.
+        :param init_type: Initialization type for linear layer. Options: 'xavier', 'avg_emb'. Default: 'xavier'.
         """
         super().__init__()
         if layers_to_use is None:
@@ -218,9 +222,7 @@ class ORCA(torch.nn.Module):
         else:
             self.cls_token = None
         self.linear = torch.nn.Linear(lm_hidden_size * len(self.layers_to_use), 2)
-        # xavier initialization
-        torch.nn.init.xavier_normal_(self.linear.weight, gain=0.01)
-        torch.nn.init.constant_(self.linear.bias, 1.0)
+        self._init_linear(init_type)
 
         self.score_type = score_type
         self.scoring_function = {
@@ -239,15 +241,60 @@ class ORCA(torch.nn.Module):
             "score_type": self.score_type,
             "layers_to_use": self.layers_to_use,
             "use_cls_token": self.use_cls_token,
+            "init_type": init_type,
         }
+
+    def _init_linear(self, init_type):
+        """
+        Initialize the linear layer with the specified initialization type.
+        :param init_type: Initialization type ('xavier' or 'avg_emb')
+        """
+        if init_type == "xavier":
+            torch.nn.init.xavier_normal_(self.linear.weight, gain=0.01)
+            torch.nn.init.constant_(self.linear.bias, 0.0)
+
+        elif init_type == "avg_emb":
+            # Get the output layer (lm_head) from the language model
+            if hasattr(self.lm, "lm_head"):
+                lm_output_layer = self.lm.lm_head
+            elif hasattr(self.lm, "score"):
+                lm_output_layer = self.lm.score
+            elif hasattr(self.lm, "classifier"):
+                lm_output_layer = self.lm.classifier
+            else:
+                # Fallback to xavier initialization if output layer not found
+                torch.nn.init.xavier_normal_(self.linear.weight, gain=0.01)
+                torch.nn.init.constant_(self.linear.bias, 0.0)
+                return
+
+            # Average the output layer weights across vocabulary dimension
+            # Shape: [vocab_size, hidden_size] -> [hidden_size]
+            with torch.no_grad():
+                avg_weights = lm_output_layer.weight.mean(dim=0)
+
+                # Replicate across concatenated layers and output dimension (2)
+                num_concat_layers = len(self.layers_to_use)
+                # Repeat the averaged weights for each concatenated layer
+                init_weights = avg_weights.repeat(num_concat_layers).unsqueeze(0).repeat(2, 1)
+
+                # Assign to linear layer
+                self.linear.weight.copy_(init_weights)
+
+                # Initialize bias
+                if lm_output_layer.bias is not None:
+                    avg_bias = lm_output_layer.bias.mean()
+                    self.linear.bias.fill_(avg_bias)
+                else:
+                    self.linear.bias.zero_()
+
+        else:
+            raise ValueError(f"Unknown init_type: {init_type}. Supported: 'xavier', 'avg_emb'")
 
     def forward(self, x, prior_params=None):
         input_ids, input_lengths = x["input_ids"], x["input_len"]
         input_embeddings = self.lm.get_input_embeddings()(input_ids)
         if self.cls_token is not None:
-            cls_token = self.cls_token.unsqueeze(0).expand(
-                input_embeddings.shape[0], -1, -1
-            )
+            cls_token = self.cls_token.unsqueeze(0).expand(input_embeddings.shape[0], -1, -1)
             input_embeddings = torch.cat([input_embeddings, cls_token], dim=1)
             input_lengths += 1
         model_outputs = self.lm(
@@ -266,12 +313,12 @@ class ORCA(torch.nn.Module):
         labels = x.get("labels", None)
 
         score, prob1, variance = self.scoring_function(params, labels)
-        score = score.mean() if score is not None else None
+        score = score.sum() if score is not None else None
         if prior_params is not None:
             # prior_params = x['prior_params']
             kl_divergence = self.param_kl_function(params, prior_params)
             if score is not None:
-                score = score + kl_divergence.mean()
+                score = score + kl_divergence.sum()
             else:
                 score = kl_divergence
         else:
@@ -316,6 +363,7 @@ class ORCA(torch.nn.Module):
             lm=lm,
             score_type=config["score_type"],
             layers_to_use=config["layers_to_use"],
+            init_type=config.get("init_type", "xavier"),
         )
         model.lm = lm
         model.load_state_dict(

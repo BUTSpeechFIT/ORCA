@@ -1,4 +1,7 @@
-"""ORCA: Open-ended Response Correctness Assessment for Audio QAs"""
+"""ORCA: Open-ended Response Correctness Assessment for Audio QAs
+
+Authors: Bolaji Yusuf, Santosh Kesiraju
+"""
 
 __version__ = "0.1.0"
 

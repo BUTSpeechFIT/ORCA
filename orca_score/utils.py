@@ -1,9 +1,10 @@
-import os
+"""Authors: Bolaji Yusuf, Santosh Kesiraju"""
+
 import json
-import yaml
+import os
 
 import torch
-
+import yaml
 from torch.utils.tensorboard import SummaryWriter
 
 
@@ -84,9 +85,7 @@ def save_checkpoint(
     if accelerator is None:
         scoring_model.save_to_directory(os.path.join(output_dir, "model"))
     else:
-        accelerator.unwrap_model(scoring_model).save_to_directory(
-            os.path.join(output_dir, "model")
-        )
+        accelerator.unwrap_model(scoring_model).save_to_directory(os.path.join(output_dir, "model"))
     if optimizer is not None:
         torch.save(optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
     if args is not None:

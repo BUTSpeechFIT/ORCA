@@ -1,3 +1,5 @@
+"""Authors: Bolaji Yusuf, Santosh Kesiraju"""
+
 import argparse
 import os
 import random
@@ -12,8 +14,12 @@ import yaml
 from peft import LoraConfig, PeftModel, get_peft_model
 from scipy.stats import kendalltau, spearmanr
 from torch.utils.data import DataLoader
-from transformers import (AutoModel, AutoModelForCausalLM, AutoTokenizer,
-                          BitsAndBytesConfig)
+from transformers import (
+    AutoModel,
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+)
 
 from orca_score import data, model
 from orca_score.utils import CompositeWriter, save_checkpoint
@@ -117,9 +123,7 @@ def parse_arguments():
         help="List of layer indices to use for scoring. If not provided, all layers will be used.",
     )
 
-    model_group.add_argument(
-        "--lora_rank", type=int, help="LoRA rank, default is no LoRA"
-    )
+    model_group.add_argument("--lora_rank", type=int, help="LoRA rank, default is no LoRA")
     model_group.add_argument(
         "--quantization_level",
         type=str,
@@ -136,6 +140,13 @@ def parse_arguments():
         "--use_flash_attention",
         action="store_true",
         help="If set, the model will use Flash Attention 2 for faster attention computation. Requires flash-attn package.",
+    )
+    model_group.add_argument(
+        "--init_type",
+        type=str,
+        default="xavier",
+        choices=["xavier", "avg_emb"],
+        help="Initialization type for the linear layer. 'xavier' uses Xavier normal initialization, 'avg_emb' uses averaged LM output layer weights.",
     )
 
     training_group = parser.add_argument_group("Training related arguments")
@@ -209,7 +220,7 @@ def parse_arguments():
     )
 
     training_group.add_argument(
-        "--num_workers", type=int, default=1, help="Number of workers for data loading."
+        "--num_workers", type=int, default=0, help="Number of workers for data loading."
     )
     training_group.add_argument(
         "--log_dir",
@@ -238,6 +249,12 @@ def parse_arguments():
         help="Random seed for reproducibility.",
     )
 
+    training_group.add_argument(
+        "--verbose",
+        action="store_true",
+        help="If set, the training process will output more detailed logs.",
+    )
+
     args = parser.parse_args()
 
     return args
@@ -257,7 +274,7 @@ def evaluate(
     device = accelerator.device
 
     val_loss = 0
-    val_count = 0
+    val_num_samples = 0
     all_val_annotations = []
     all_val_predictions = []
     all_val_params = []
@@ -268,10 +285,18 @@ def evaluate(
     for val_batch in tqdm.tqdm(val_dataloader, disable=not accelerator.is_main_process):
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
             val_outputs = scoring_model(val_batch)
-            loss = val_outputs["loss"]
-        loss = accelerator.gather(loss).mean()
-        val_loss += loss.item()
-        val_count += 1
+            loss = val_outputs["loss"]  # This is sum of losses in the batch
+
+        batch_size = val_batch["input_ids"].shape[0]
+
+        # Gather loss sum and batch size across all processes
+        gathered_loss_sum = accelerator.gather(loss.detach()).sum().item()
+        gathered_batch_size = (
+            accelerator.gather(torch.tensor(batch_size, device=loss.device)).sum().item()
+        )
+
+        val_loss += gathered_loss_sum
+        val_num_samples += gathered_batch_size
 
         val_annotation = val_batch["average_labels"]
         val_prediction = val_outputs["prob1"]
@@ -284,10 +309,10 @@ def evaluate(
             val_variance_prediction = val_outputs["variance"]
             all_val_variance_annotations.extend(val_variance_annotation.cpu().tolist())
             all_val_variance_predictions.extend(val_variance_prediction.cpu().tolist())
-    metrics_to_sync = torch.tensor([val_loss, val_count], device=device)
+    metrics_to_sync = torch.tensor([val_loss, val_num_samples], device=device)
     metrics_to_sync = accelerator.gather(metrics_to_sync)
     val_loss = metrics_to_sync[0].sum().item()
-    val_count = metrics_to_sync[1].sum().item()
+    val_num_samples = metrics_to_sync[1].sum().item()
 
     with open(
         os.path.join(
@@ -314,9 +339,7 @@ def evaluate(
     all_val_variance_annotations = []
     all_val_variance_predictions = []
     for i in range(accelerator.num_processes):
-        with open(
-            os.path.join(args.output_dir, f"val_predictions_{j}_{i}.yaml"), "r"
-        ) as f:
+        with open(os.path.join(args.output_dir, f"val_predictions_{j}_{i}.yaml"), "r") as f:
             result_data = yaml.safe_load(f)
             all_val_annotations.extend(result_data["annotations"])
             all_val_predictions.extend(result_data["predictions"])
@@ -328,21 +351,13 @@ def evaluate(
     kendall_tau = kendalltau(all_val_annotations, all_val_predictions)
     spearman_corr = spearmanr(all_val_annotations, all_val_predictions)
 
-    variance_kendall_tau = kendalltau(
-        all_val_variance_annotations, all_val_variance_predictions
-    )
-    variance_spearman_corr = spearmanr(
-        all_val_variance_annotations, all_val_variance_predictions
-    )
+    variance_kendall_tau = kendalltau(all_val_variance_annotations, all_val_variance_predictions)
+    variance_spearman_corr = spearmanr(all_val_variance_annotations, all_val_variance_predictions)
 
     if accelerator.is_main_process:
-        writer.add_scalar("Loss/val_loss_mean", val_loss / val_count, j)
-        writer.add_scalar(
-            f"Loss/val_loss_mean_{args.score_type}", val_loss / val_count, j
-        )
-        writer.add_scalar(
-            "Correlations/Mean Kendall's Tau", float(kendall_tau.statistic), j
-        )
+        writer.add_scalar("Loss/val_loss_mean", val_loss / val_num_samples, j)
+        writer.add_scalar(f"Loss/val_loss_mean_{args.score_type}", val_loss / val_num_samples, j)
+        writer.add_scalar("Correlations/Mean Kendall's Tau", float(kendall_tau.statistic), j)
         writer.add_scalar(
             "Correlations/Mean Spearman's Rank Correlation",
             float(spearman_corr.statistic),
@@ -361,7 +376,7 @@ def evaluate(
 
     logging_dict.update(
         {
-            "val_loss": round(val_loss / val_count, 6),
+            "val_loss": round(val_loss / val_num_samples, 6),
             "best_val_rho": round(max(best_val_rho, float(spearman_corr.statistic)), 6),
             "variance_tau": round(float(variance_kendall_tau.statistic), 6),
             "variance_rho": round(float(variance_spearman_corr.statistic), 6),
@@ -388,22 +403,28 @@ def main():
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
 
-    ddp_kwarg_handler = accelerate.utils.DistributedDataParallelKwargs(
-        find_unused_parameters=True
+    ddp_kwarg_handler = accelerate.utils.DistributedDataParallelKwargs(find_unused_parameters=True)
+    accelerator = accelerate.Accelerator(
+        gradient_accumulation_steps=args.accumulation_steps,
+        kwargs_handlers=[ddp_kwarg_handler],
     )
-    accelerator = accelerate.Accelerator(kwargs_handlers=[ddp_kwarg_handler])
     torch.tensor(0).to(accelerator.device)
     device = accelerator.device
 
-    for arg in vars(args):
-        accelerator.print(f"{arg}: {getattr(args, arg)}")
+    # Print arguments in two-column format
+    # args_dict = vars(args)
+    # max_key_length = max(len(str(key)) for key in args_dict.keys())
+    # accelerator.print("\n" + "=" * 100)
+    # accelerator.print(f"{'Argument':<{max_key_length + 2}} {'Value'}")
+    # accelerator.print("=" * 100)
+    # for arg, value in args_dict.items():
+    #     accelerator.print(f"{arg:<{max_key_length + 2}} {value}")
+    # accelerator.print("=" * 100 + "\n")
 
     # Load the model and tokenizer
     attn_impl = "flash_attention_2" if args.use_flash_attention else None
 
-    accelerator.print(
-        f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'Not Set')}"
-    )
+    accelerator.print(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'Not Set')}")
     accelerator.print(
         f"Loading model {args.model} with {args.quantization_level if args.quantization_level != 'none' else 'bfloat16'} precision"
         + (" and flash attention 2" if args.use_flash_attention else "")
@@ -455,9 +476,10 @@ def main():
         score_type=args.score_type,
         layers_to_use=args.layers_to_use,
         use_cls_token=args.use_cls_token,
+        init_type=args.init_type,
     ).to(torch.bfloat16)
 
-    accelerator.print(scoring_model)
+    # accelerator.print(scoring_model)
 
     if args.prompts_yaml is not None:
         prompts = yaml.safe_load(open(args.prompts_yaml, "r"))
@@ -482,7 +504,7 @@ def main():
         train_dataloader = DataLoader(
             train_dataset,
             batch_size=args.batch_size,
-            shuffle=True,
+            shuffle=False,
             num_workers=args.num_workers,
             collate_fn=collate_fn,
             pin_memory=True,
@@ -504,7 +526,7 @@ def main():
             DataLoader(
                 train_dataset,
                 batch_size=args.batch_size,
-                shuffle=True,
+                shuffle=False,
                 num_workers=0,
                 collate_fn=collate_fn,
                 pin_memory=True,
@@ -556,9 +578,7 @@ def main():
                 attn_implementation=attn_impl,
             )
             accelerator.print("Loaded LM model from checkpoint")
-        scoring_model = model.ORCA.load_from_directory(
-            args.load_checkpoint, lm, device=device
-        )
+        scoring_model = model.ORCA.load_from_directory(args.load_checkpoint, lm, device=device)
     if args.resume:
         accelerator.print("Resuming from latest checkpoint")
         latest_checkpoint = os.path.join(args.output_dir, "latest")
@@ -572,16 +592,12 @@ def main():
                 attn_implementation=attn_impl,
             )
             accelerator.print("Loaded LM model from checkpoint")
-        scoring_model = model.ORCA.load_from_directory(
-            latest_checkpoint, lm, device=device
-        )
+        scoring_model = model.ORCA.load_from_directory(latest_checkpoint, lm, device=device)
         with open(os.path.join(latest_checkpoint, "metrics.yaml"), "r") as f:
             all_metrics = yaml.safe_load(f)
         start_step = all_metrics[-1]["step"] if all_metrics else 0
         best_val_rho = (
-            all_metrics[-1].get("mean_rho", best_val_rho)
-            if all_metrics
-            else float("-inf")
+            all_metrics[-1].get("mean_rho", best_val_rho) if all_metrics else float("-inf")
         )
 
     optimizer_dict_list = []
@@ -603,9 +619,7 @@ def main():
     if args.resume:
         accelerator.print("Resuming optimizer state from checkpoint")
         latest_checkpoint = os.path.join(args.output_dir, "latest")
-        optimizer.load_state_dict(
-            torch.load(os.path.join(latest_checkpoint, "optimizer.pt"))
-        )
+        optimizer.load_state_dict(torch.load(os.path.join(latest_checkpoint, "optimizer.pt")))
     lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer, lr_lambda=partial(lr_lambda_linear_with_min_lr, args=args)
     )
@@ -632,11 +646,11 @@ def main():
             exp_name = args.exp_name
         else:
             model_name = args.model.split("/")[-1]
-            effective_batch = (
-                args.batch_size * args.accumulation_steps * accelerator.num_processes
-            )
+            effective_batch = args.batch_size * args.accumulation_steps * accelerator.num_processes
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            exp_name = f"{model_name}_{args.score_type}_lr{args.peak_lr}_bs{effective_batch}__{timestamp}"
+            exp_name = (
+                f"{model_name}_{args.score_type}_lr{args.peak_lr}_bs{effective_batch}__{timestamp}"
+            )
 
         jsonl_log_path = os.path.join(args.output_dir, "training_log.jsonl")
         tensorboard_dir = os.path.join(args.log_dir, exp_name) if args.log_dir else None
@@ -656,39 +670,93 @@ def main():
         with open(os.path.join(args.output_dir, "args.yaml"), "w") as f:
             yaml.dump(args_dict, f)
     scoring_model.train()
+
     for j in tqdm.tqdm(
         range(start_step + 1, args.max_steps + 1),
-        disable=not accelerator.is_main_process,
+        disable=not args.verbose and not accelerator.is_main_process,
     ):
+        step_loss_sum = 0  # Sum of losses across all samples
+        step_num_samples = 0  # Total number of samples
         for k in range(args.accumulation_steps):
-            try:
-                batch = next(train_loader_iter)
-            except StopIteration:
-                train_loader_iter = iter(train_dataloader)
-                batch = next(train_loader_iter)
-            with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-                outputs = scoring_model(batch)
-                loss = outputs["loss"]
-            accelerator.backward(loss / args.accumulation_steps)
-            loss = accelerator.gather(loss.detach()).mean().item()
-            train_loss += loss / args.accumulation_steps
-        train_count += 1
-        grad_norm = accelerator.clip_grad_norm_(
-            scoring_model.parameters(), args.max_grad_norm
-        )
-        optimizer.step()
-        lr_scheduler.step()
-        optimizer.zero_grad(set_to_none=True)
+            with accelerator.accumulate(scoring_model):
+                try:
+                    batch = next(train_loader_iter)
+                except StopIteration:
+                    train_loader_iter = iter(train_dataloader)
+                    batch = next(train_loader_iter)
 
-        if accelerator.is_main_process:
+                batch_size = batch["input_ids"].shape[0]
+
+                with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                    outputs = scoring_model(batch)
+                    loss = outputs["loss"]  # This is now sum of losses in the batch
+
+                # Check for abnormally high loss and log diagnostics
+                if loss.item() > 1000 or torch.isnan(loss) or torch.isinf(loss):
+                    accelerator.print(
+                        f"WARNING: High/invalid loss detected at step {j}, accumulation {k+1}!"
+                    )
+                    accelerator.print(f"  Loss: {loss.item()}")
+                    if "params" in outputs:
+                        params = outputs["params"]
+                        concentrations = params.exp()
+                        accelerator.print(
+                            f"  Concentration1 range: [{concentrations[:, 0].min().item():.4f}, {concentrations[:, 0].max().item():.4f}]"
+                        )
+                        accelerator.print(
+                            f"  Concentration0 range: [{concentrations[:, 1].min().item():.4f}, {concentrations[:, 1].max().item():.4f}]"
+                        )
+                    if "labels" in batch:
+                        valid_labels = batch["labels"][batch["labels"] >= 0]
+                        if len(valid_labels) > 0:
+                            accelerator.print(
+                                f"  Label range: [{valid_labels.min().item():.4f}, {valid_labels.max().item():.4f}]"
+                            )
+
+                accelerator.backward(loss)
+
+                # Gather the sum of losses across all processes
+                gathered_loss_sum = accelerator.gather(loss.detach()).sum().item()
+                # Gather total batch size across all processes
+                gathered_batch_size = (
+                    accelerator.gather(torch.tensor(batch_size, device=loss.device)).sum().item()
+                )
+
+                step_loss_sum += gathered_loss_sum
+                step_num_samples += gathered_batch_size
+
+                if args.verbose:
+                    accelerator.print(
+                        f"Step {j}, Accumulation {k+1}/{args.accumulation_steps}, "
+                        f"Batch Loss Sum: {gathered_loss_sum:.4f}, Batch Size: {gathered_batch_size}, "
+                        f"Batch Avg: {gathered_loss_sum/gathered_batch_size:.4f}, Sync: {accelerator.sync_gradients}"
+                    )
+
+                if accelerator.sync_gradients:
+                    grad_norm = accelerator.clip_grad_norm_(
+                        scoring_model.parameters(), args.max_grad_norm
+                    )
+                    # Average loss across all samples in this step
+                    avg_step_loss = step_loss_sum / step_num_samples
+                    train_loss += avg_step_loss
+                    train_count += 1
+                    if args.verbose:
+                        accelerator.print(
+                            f"Step {j}: Step Loss Sum: {step_loss_sum:.4f}, Num Samples: {step_num_samples}, "
+                            f"Avg Loss: {avg_step_loss:.4f}, Running Avg: {train_loss/train_count:.4f}, Grad Norm: {grad_norm:.4f}"
+                        )
+
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+
+        if accelerator.is_main_process and train_count > 0:
             writer.add_scalar("Loss/train_loss", train_loss / train_count, j)
-            writer.add_scalar(f"Loss/train_loss_{args.score_type}", loss, j)
             writer.add_scalar("Learning Rate", optimizer.param_groups[0]["lr"], j)
-            writer.add_scalar(
-                "Data/Text Length", batch["input_len"].float().mean().item(), j
-            )
+            writer.add_scalar("Data/Text Length", batch["input_len"].float().mean().item(), j)
             writer.add_scalar("Data/Batch Size", batch["input_ids"].shape[0], j)
-            writer.add_scalar("Loss/Grad Norm", grad_norm, j)
+            if accelerator.sync_gradients:
+                writer.add_scalar("Loss/Grad Norm", grad_norm, j)
 
         if j % args.val_steps == 0:
 
@@ -741,9 +809,7 @@ def main():
 
         scoring_model.train()
 
-        recent_val_rho = [
-            m["mean_rho"] for m in all_metrics[-args.early_stopping_patience :]
-        ]
+        recent_val_rho = [m["mean_rho"] for m in all_metrics[-args.early_stopping_patience :]]
         all_val_rhos = [m["mean_rho"] for m in all_metrics]
         if len(all_val_rhos) > args.early_stopping_patience and all(
             v < max(all_val_rhos) for v in recent_val_rho
