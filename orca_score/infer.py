@@ -11,17 +11,13 @@ import yaml
 from peft import PeftModel
 from scipy.stats import kendalltau, spearmanr
 from torch.utils.data import DataLoader
-from transformers import (
-    AutoModel,
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    BitsAndBytesConfig,
-)
+from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 
 from orca_score import data, model
 
 
 def parse_arguments():
+    """Parse command line arguments."""
 
     parser = argparse.ArgumentParser(
         description="ORCA Inference Script",
@@ -58,7 +54,7 @@ def parse_arguments():
         "--model_path",
         type=str,
         required=True,
-        help="Path to the trained ORCA model directory",
+        help="Path to the trained ORCA model directory (best/model/)",
     )
     parser.add_argument(
         "--data",
@@ -69,8 +65,8 @@ def parse_arguments():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="orca_inference_output",
-        help="Directory to save inference results",
+        default=None,
+        help="Directory to save inference results. Defaults to sub-dir in model directory.",
     )
 
     args = parser.parse_args()
@@ -86,10 +82,15 @@ def main():
     device = accelerator.device
     torch.tensor(0).to(accelerator.device)
 
-    for arg in vars(args):
-        accelerator.print(f"{arg}: {getattr(args, arg)}")
-
+    if not args.output_dir:
+        args.output_dir = os.path.join(os.path.dirname(args.model_path), "inference_results")
     os.makedirs(args.output_dir, exist_ok=True)
+
+    accelerator.print(f"{'Argument':<30} {'Value'}")
+    accelerator.print("-" * 50)
+    for arg in vars(args):
+        accelerator.print(f"{arg:<30} {getattr(args, arg)}")
+    accelerator.print("-" * 50)
 
     if args.test_set_is_labeled:
         inference_data = data.UnifiedAnnotationDataset(
@@ -122,7 +123,7 @@ def main():
             os.path.join(args.model_path, "lm"),
             low_cpu_mem_usage=True,
         )
-        lm = lm.merge_and_unload()
+        lm = lm.merge_and_unload()  # type: ignore
     else:
         lm = AutoModel.from_pretrained(
             os.path.join(args.model_path, "lm"),
@@ -134,7 +135,7 @@ def main():
         tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
     else:
         tokenizer = AutoTokenizer.from_pretrained(
-            os.path.join(os.path.dirname(args.model_path), "tokenizer"),
+            os.path.join(os.path.dirname(args.model_path), "../tokenizer"),
         )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -239,21 +240,33 @@ def main():
 
         if args.test_set_is_labeled:
             # Compute Kendall Tau and Spearman correlation
-            tau, _ = kendalltau(all_ratings, all_prob1)
-            spearman_corr, _ = spearmanr(all_ratings, all_prob1)
-            print(f"Kendall Tau: {tau}")
-            print(f"Spearman Correlation: {spearman_corr}")
+            tau = kendalltau(all_ratings, all_prob1)
+            spearman_corr = spearmanr(all_ratings, all_prob1)
+            tau_val = float(tau.statistic)
+            spearman_val = float(spearman_corr.statistic)
+
             metrics = {
-                "rating_kendall_tau": float(tau),
-                "rating_spearman_correlation": float(spearman_corr),
+                "rating_kendall_tau": round(tau_val, 6),
+                "rating_spearman_correlation": round(spearman_val, 6),
             }
+
+            print("\n" + "=" * 40)
+            print(f"{'Metric':<25} {'Value':>10}")
+            print("-" * 40)
+            print(f"{'Kendall τ (tau)':<25} {tau_val:>10.6f}")
+            print(f"{'Spearman ρ (rho)':<25} {spearman_val:>10.6f}")
+
             if scoring_model.score_type == "beta":
-                variance_tau, _ = kendalltau(all_ground_truth_variances, all_variance)
-                variance_spearman_corr, _ = spearmanr(all_ground_truth_variances, all_variance)
-                print(f"Variance Kendall Tau: {variance_tau}")
-                print(f"Variance Spearman Correlation: {variance_spearman_corr}")
-                metrics["variance_kendall_tau"] = float(variance_tau)
-                metrics["variance_spearman_correlation"] = float(variance_spearman_corr)
+                variance_tau = kendalltau(all_ground_truth_variances, all_variance)
+                variance_spearman_corr = spearmanr(all_ground_truth_variances, all_variance)
+                variance_tau_val = float(variance_tau.statistic)
+                variance_spearman_val = float(variance_spearman_corr.statistic)
+                print(f"{'Variance Kendall τ':<25} {variance_tau_val:>10.6f}")
+                print(f"{'Variance Spearman ρ':<25} {variance_spearman_val:>10.6f}")
+                metrics["variance_kendall_tau"] = round(variance_tau_val, 6)
+                metrics["variance_spearman_correlation"] = round(variance_spearman_val, 6)
+
+            print("=" * 40 + "\n")
 
             score_file = os.path.join(args.output_dir, "scores.yaml")
             with open(score_file, "w") as f:

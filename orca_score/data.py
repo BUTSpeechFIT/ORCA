@@ -32,12 +32,14 @@ class UnifiedAnnotationDataset(Dataset):
         skip_rationale=False,
         skip_question=False,
         add_transcript=False,
+        log_fn=None,
     ):
         """
         A dataset that loads annotations from a JSON file and formats them for training.
         :param annotations_file: Path to the JSON file containing annotations.
         :param prompts: List of prompts to randomply sample a prompt to be prepended to the data. If None, a default empty prompt is used.
         :param filter_func: A function that takes an item and returns True if the item should be included in the dataset, False otherwise.
+        :param log_fn: Optional logging function. If provided, will log filtering statistics.
         """
         self.annotations = json.load(open(annotations_file, "r", encoding="utf-8"))
         self.annotation_keys = list(self.annotations.keys())
@@ -58,16 +60,17 @@ class UnifiedAnnotationDataset(Dataset):
         self.skip_rationale = skip_rationale
         self.skip_question = skip_question
         self.add_transcript = add_transcript
+        self.log_fn = log_fn or print
 
         if filter_func is not None:
-            print("Length before filtering:", len(self.annotation_keys))
+            self.log_fn(f"Length before filtering: {len(self.annotation_keys)}")
             self.annotation_keys = [
                 key for key in self.annotation_keys if filter_func(self[self.keys_to_id[key]])
             ]
             self.keys_to_id = {key: i for i, key in enumerate(self.annotation_keys)}
             self.annotation_ids = ["_".join(key.split("_")[:-2]) for key in self.annotation_keys]
             self.model_ids = ["_".join(key.split("_")[-2:]) for key in self.annotation_keys]
-            print("Length after filtering:", len(self.annotation_keys))
+            self.log_fn(f"Length after filtering: {len(self.annotation_keys)}")
 
     def __len__(self):
         return len(self.annotation_keys)

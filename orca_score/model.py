@@ -77,10 +77,10 @@ def beta_llh(params, labels, eps=1e-2):
     :return: Tensor of shape (batch_size, num_annotations)
     """
     original_dtype = params.dtype
-    params: torch.Tensor = params.float()
-    params = params.exp()
-    concentration1 = params[:, 0]
-    concentration0 = params[:, 1]
+    params_float: torch.Tensor = params.float()
+    params_exp = params_float.exp()
+    concentration1 = params_exp[:, 0]
+    concentration0 = params_exp[:, 1]
 
     beta_distribution = torch.distributions.Beta(
         concentration1.unsqueeze(-1), concentration0.unsqueeze(-1)
@@ -115,10 +115,10 @@ def beta_moment_matching(params, labels, eps=1e-2):
     :return: Tensor of shape (batch_size,)
     """
     original_dtype = params.dtype
-    params: torch.Tensor = params.float()
-    params = params.exp()
-    concentration1 = params[:, 0]
-    concentration0 = params[:, 1]
+    params_float: torch.Tensor = params.float()
+    params_exp = params_float.exp()
+    concentration1 = params_exp[:, 0]
+    concentration0 = params_exp[:, 1]
 
     # beta_distribution = torch.distributions.Beta(
     #    concentration1.unsqueeze(-1), concentration0.unsqueeze(-1)
@@ -156,14 +156,14 @@ def beta_params_kl(params_p, params_q):
     :return: Tensor of shape (batch_size,)
     """
     original_dtype = params_p.dtype
-    params_p: torch.Tensor = params_p.float()
-    params_q: torch.Tensor = params_q.float()
-    params_p = params_p.exp()
-    params_q = params_q.exp()
-    concentration1_p = params_p[:, 0]
-    concentration0_p = params_p[:, 1]
-    concentration1_q = params_q[:, 0]
-    concentration0_q = params_q[:, 1]
+    params_p_float: torch.Tensor = params_p.float()
+    params_q_float: torch.Tensor = params_q.float()
+    params_p_float = params_p_float.exp()
+    params_q_float = params_q_float.exp()
+    concentration1_p = params_p_float[:, 0]
+    concentration0_p = params_p_float[:, 1]
+    concentration1_q = params_q_float[:, 0]
+    concentration0_q = params_q_float[:, 1]
 
     beta_distribution_p = torch.distributions.Beta(concentration1_p, concentration0_p)
     beta_distribution_q = torch.distributions.Beta(concentration1_q, concentration0_q)
@@ -179,10 +179,10 @@ def bernoulli_params_kl(params_p, params_q):
     :return: Tensor of shape (batch_size,)
     """
     original_dtype = params_p.dtype
-    params_p: torch.Tensor = params_p.float()
-    params_q: torch.Tensor = params_q.float()
-    logprobs_p = torch.nn.functional.log_softmax(params_p, dim=-1)
-    logprobs_q = torch.nn.functional.log_softmax(params_q, dim=-1)
+    params_p_float: torch.Tensor = params_p.float()
+    params_q_float: torch.Tensor = params_q.float()
+    logprobs_p = torch.nn.functional.log_softmax(params_p_float, dim=-1)
+    logprobs_q = torch.nn.functional.log_softmax(params_q_float, dim=-1)
     probs_p = logprobs_p.exp()
     kl_divergence = (probs_p * (logprobs_p - logprobs_q)).sum(dim=-1)
     return kl_divergence.to(original_dtype)
@@ -192,17 +192,15 @@ class ORCA(torch.nn.Module):
     def __init__(
         self,
         lm,
-        score_type="bernoulli",
+        score_type="beta",
         layers_to_use=(-1,),
         use_cls_token=False,
-        init_type="xavier",
     ):
         """
         Initialize the ORCA model (formerly MEME).
         :param lm: pre-trained language model (e.g., Gemma, Llama, etc.)
         :param score_type: Type of scoring function to use, either 'bernoulli' or 'beta'.
         :param layers_to_use: List of layer concatenate as input to the scorer. If None, all layers will be used.
-        :param init_type: Initialization type for linear layer. Options: 'xavier', 'avg_emb'. Default: 'xavier'.
         """
         super().__init__()
         if layers_to_use is None:
@@ -222,7 +220,7 @@ class ORCA(torch.nn.Module):
         else:
             self.cls_token = None
         self.linear = torch.nn.Linear(lm_hidden_size * len(self.layers_to_use), 2)
-        self._init_linear(init_type)
+        # self._init_linear()
 
         self.score_type = score_type
         self.scoring_function = {
@@ -230,7 +228,9 @@ class ORCA(torch.nn.Module):
             "beta": beta_llh,
             "mse": mse_loss,
             "bmm": beta_moment_matching,
-        }.get(score_type)
+        }.get(
+            score_type, "beta"
+        )  # defaults to Beta if unknown score_type
         self.param_kl_function = {
             "bernoulli": bernoulli_params_kl,
             "beta": beta_params_kl,
@@ -241,54 +241,14 @@ class ORCA(torch.nn.Module):
             "score_type": self.score_type,
             "layers_to_use": self.layers_to_use,
             "use_cls_token": self.use_cls_token,
-            "init_type": init_type,
         }
 
-    def _init_linear(self, init_type):
+    def _init_linear(self):
         """
-        Initialize the linear layer with the specified initialization type.
-        :param init_type: Initialization type ('xavier' or 'avg_emb')
+        Initialize the linear layer with Xavier normal initialization.
         """
-        if init_type == "xavier":
-            torch.nn.init.xavier_normal_(self.linear.weight, gain=0.01)
-            torch.nn.init.constant_(self.linear.bias, 0.0)
-
-        elif init_type == "avg_emb":
-            # Get the output layer (lm_head) from the language model
-            if hasattr(self.lm, "lm_head"):
-                lm_output_layer = self.lm.lm_head
-            elif hasattr(self.lm, "score"):
-                lm_output_layer = self.lm.score
-            elif hasattr(self.lm, "classifier"):
-                lm_output_layer = self.lm.classifier
-            else:
-                # Fallback to xavier initialization if output layer not found
-                torch.nn.init.xavier_normal_(self.linear.weight, gain=0.01)
-                torch.nn.init.constant_(self.linear.bias, 0.0)
-                return
-
-            # Average the output layer weights across vocabulary dimension
-            # Shape: [vocab_size, hidden_size] -> [hidden_size]
-            with torch.no_grad():
-                avg_weights = lm_output_layer.weight.mean(dim=0)
-
-                # Replicate across concatenated layers and output dimension (2)
-                num_concat_layers = len(self.layers_to_use)
-                # Repeat the averaged weights for each concatenated layer
-                init_weights = avg_weights.repeat(num_concat_layers).unsqueeze(0).repeat(2, 1)
-
-                # Assign to linear layer
-                self.linear.weight.copy_(init_weights)
-
-                # Initialize bias
-                if lm_output_layer.bias is not None:
-                    avg_bias = lm_output_layer.bias.mean()
-                    self.linear.bias.fill_(avg_bias)
-                else:
-                    self.linear.bias.zero_()
-
-        else:
-            raise ValueError(f"Unknown init_type: {init_type}. Supported: 'xavier', 'avg_emb'")
+        torch.nn.init.xavier_normal_(self.linear.weight, gain=0.01)
+        torch.nn.init.constant_(self.linear.bias, 0.0)
 
     def forward(self, x, prior_params=None):
         input_ids, input_lengths = x["input_ids"], x["input_len"]
@@ -314,7 +274,7 @@ class ORCA(torch.nn.Module):
 
         score, prob1, variance = self.scoring_function(params, labels)
         score = score.sum() if score is not None else None
-        if prior_params is not None:
+        if prior_params is not None and self.param_kl_function is not None:
             # prior_params = x['prior_params']
             kl_divergence = self.param_kl_function(params, prior_params)
             if score is not None:
@@ -363,7 +323,6 @@ class ORCA(torch.nn.Module):
             lm=lm,
             score_type=config["score_type"],
             layers_to_use=config["layers_to_use"],
-            init_type=config.get("init_type", "xavier"),
         )
         model.lm = lm
         model.load_state_dict(

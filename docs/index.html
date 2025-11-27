@@ -247,8 +247,8 @@
             </div>
 
             <p style="font-size: 1.1em; margin: 20px 0;">
-                ORCA is a framework for assessing the quality of open-ended responses in audio question-answering tasks.
-                It uses language model representations with Beta distribution modeling to capture both the mean quality
+                ORCA is a framework for assessing the correctness of open-ended responses in audio question-answering tasks.
+                It uses language model representations with Beta distribution modeling to capture both the mean correctness
                 and uncertainty (variance) of responses based on multiple human annotations.
             </p>
 
@@ -262,10 +262,10 @@
             </div>
 
             <div class="buttons">
-                <a href="https://github.com/BUTSpeechFIT/Orca" class="btn btn-primary" target="_blank">
+                <a href="https://github.com/BUTSpeechFIT/ORCA" class="btn btn-primary" target="_blank">
                     📦 GitHub Repository
                 </a>
-                <a href="https://github.com/BUTSpeechFIT/Orca#citation" class="btn btn-secondary" target="_blank">
+                <a href="https://github.com/BUTSpeechFIT/ORCA#citation" class="btn btn-secondary" target="_blank">
                     📚 Citation
                 </a>
                 <a href="mailto:kesiraju@fit.vut.cz" class="btn btn-tertiary">
@@ -306,7 +306,7 @@
                 <div style="text-align: left; max-width: 600px; margin: 0 auto;">
                     <strong>Beta Distribution captures:</strong>
                     <ul style="margin-top: 10px; padding-left: 20px;">
-                        <li><strong>Mean quality:</strong> E[score] = α / (α + β)</li>
+                        <li><strong>Mean correctness score:</strong> E[score] = α / (α + β)</li>
                         <li><strong>Uncertainty/Variance:</strong> Var[score] = (α·β) / ((α+β)²·(α+β+1))</li>
                     </ul>
                 </div>
@@ -365,7 +365,7 @@ pip install -e .</code></pre>
     <footer>
         <p>
             © 2025 Speech@FIT, Brno University of Technology |
-            <a href="https://github.com/BUTSpeechFIT/Orca/blob/main/LICENSE" target="_blank">MIT License</a>
+            <a href="https://github.com/BUTSpeechFIT/ORCA/blob/main/LICENSE" target="_blank">MIT License</a>
         </p>
     </footer>
 </body>

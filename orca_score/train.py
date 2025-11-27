@@ -2,7 +2,9 @@
 
 import argparse
 import os
+import platform
 import random
+import sys
 from datetime import datetime
 from functools import partial
 
@@ -23,6 +25,53 @@ from transformers import (
 
 from orca_score import data, model
 from orca_score.utils import CompositeWriter, save_checkpoint
+
+
+def write_to_log(args, total_params, trainable_params, total_batch_size, writer, accelerator):
+
+    writer.log("== MODEL CONFIGURATION ==")
+    writer.log(f"Model: {args.model}")
+    writer.log(f"Score type: {args.score_type}")
+    writer.log(f"Quantization: {args.quantization_level}")
+    writer.log(f"LoRA rank: {args.lora_rank if args.lora_rank else 'None (full fine-tuning)'}")
+    writer.log(f"Layers to use: {args.layers_to_use if args.layers_to_use else 'All'}")
+    writer.log(f"Use CLS token: {args.use_cls_token}")
+    writer.log(f"Flash Attention 2: {args.use_flash_attention}")
+    writer.log(f"Total parameters: {total_params:.1f}M", to_console=True)
+    writer.log(f"Trainable parameters: {trainable_params:.1f}M", to_console=True)
+    writer.log(f"Trainable ratio: {trainable_params/total_params*100:.2f}%", to_console=True)
+
+    writer.log("== TRAINING CONFIGURATION ==")
+    writer.log(f"Total batch size: {total_batch_size}")
+    writer.log(f"  - Processes: {accelerator.num_processes}")
+    writer.log(f"  - Per-device batch size: {args.batch_size}")
+    writer.log(f"  - Gradient accumulation steps: {args.accumulation_steps}")
+    writer.log(f"Max steps: {args.max_steps}")
+    writer.log(f"Validation interval: {args.val_steps} steps")
+    writer.log(f"Save interval: {args.save_steps} steps")
+    writer.log(f"Peak learning rate: {args.peak_lr}")
+    writer.log(f"Min LR ratio: {args.min_lr_ratio}")
+    writer.log(f"Warmup steps: {args.warmup_steps}")
+    writer.log(f"Weight decay: {args.weight_decay}")
+    writer.log(f"Max gradient norm: {args.max_grad_norm}")
+    writer.log(f"LR ratio classifier: {args.lr_ratio_classifier}")
+    writer.log(f"Early stopping patience: {args.early_stopping_patience}")
+
+    writer.log("== DATA CONFIGURATION ==")
+    writer.log(f"Training data: {args.train_data}")
+    writer.log(f"Validation data: {args.val_data}")
+    writer.log(f"Max data length: {args.max_data_length}")
+    writer.log(f"Skip rationale: {args.skip_rationale}")
+    writer.log(f"Skip question: {args.skip_question}")
+    writer.log(f"Add transcript: {args.add_transcript}")
+
+
+def set_seeds(seed):
+    """Set random seeds for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
 def lr_lambda_linear_with_min_lr(step, args):
@@ -119,7 +168,7 @@ def parse_arguments():
         "--layers_to_use",
         nargs="+",
         type=int,
-        default=None,
+        default=[-1],
         help="List of layer indices to use for scoring. If not provided, all layers will be used.",
     )
 
@@ -140,13 +189,6 @@ def parse_arguments():
         "--use_flash_attention",
         action="store_true",
         help="If set, the model will use Flash Attention 2 for faster attention computation. Requires flash-attn package.",
-    )
-    model_group.add_argument(
-        "--init_type",
-        type=str,
-        default="xavier",
-        choices=["xavier", "avg_emb"],
-        help="Initialization type for the linear layer. 'xavier' uses Xavier normal initialization, 'avg_emb' uses averaged LM output layer weights.",
     )
 
     training_group = parser.add_argument_group("Training related arguments")
@@ -258,6 +300,274 @@ def parse_arguments():
     args = parser.parse_args()
 
     return args
+
+
+def get_dataloaders(args, tokenizer, writer):
+    """Create training and validation dataloaders."""
+
+    if args.prompts_yaml is not None:
+        prompts = yaml.safe_load(open(args.prompts_yaml, "r"))
+    else:
+        prompts = None
+
+    collate_fn = data.CollateFn(tokenizer)
+    if args.dataset_sampling_weights is None:
+        train_dataset = data.ConcatenatedDataset(
+            [
+                data.UnifiedAnnotationDataset(
+                    jfile,
+                    prompts=prompts,
+                    filter_func=lambda x: len(x["text"]) <= args.max_data_length,
+                    skip_rationale=args.skip_rationale,
+                    skip_question=args.skip_question,
+                    add_transcript=args.add_transcript,
+                    log_fn=lambda msg: writer.log(msg, to_console=True),
+                )
+                for jfile in args.train_data
+            ]
+        )
+        train_dataloader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            collate_fn=collate_fn,
+            pin_memory=True,
+        )
+    else:
+        train_datasets = [
+            data.UnifiedAnnotationDataset(
+                jfile,
+                prompts=prompts,
+                filter_func=lambda x: len(x["text"]) <= args.max_data_length,
+                skip_rationale=args.skip_rationale,
+                skip_question=args.skip_question,
+                add_transcript=args.add_transcript,
+                log_fn=lambda msg: writer.log(msg, to_console=True),
+            )
+            for jfile in args.train_data
+        ]
+
+        train_dataloaders = [
+            DataLoader(
+                train_dataset,
+                batch_size=args.batch_size,
+                shuffle=False,
+                num_workers=0,
+                collate_fn=collate_fn,
+                pin_memory=True,
+            )
+            for train_dataset in train_datasets
+        ]
+        train_dataset = data.DatasetWithSampling(
+            train_dataloaders, sampling_weights=args.dataset_sampling_weights
+        )
+        train_dataloader = DataLoader(
+            train_dataset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=args.num_workers,
+            collate_fn=lambda x: x[0],
+        )
+
+    val_dataset = data.UnifiedAnnotationDataset(
+        args.val_data,
+        prompts=prompts,
+        skip_rationale=args.skip_rationale,
+        skip_question=args.skip_question,
+        log_fn=lambda msg: writer.log(msg, to_console=True),
+    )
+
+    val_dataloader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        collate_fn=collate_fn,
+    )
+
+    writer.log(f"Total number of training samples: {len(train_dataset)}", to_console=True)
+    writer.log(f"Total number of validation samples: {len(val_dataset)}", to_console=True)
+
+    return train_dataloader, val_dataloader
+
+
+def build_model(args, accelerator, device, writer):
+
+    # Load the model and tokenizer
+    attn_impl = "flash_attention_2" if args.use_flash_attention else None
+
+    # Log model loading info
+    if accelerator.is_main_process:
+        precision = args.quantization_level if args.quantization_level != "none" else "bfloat16"
+        flash_attn = " with Flash Attention 2" if args.use_flash_attention else ""
+        writer.log(f"Loading {args.model} with {precision} precision{flash_attn}", to_console=True)
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=args.quantization_level == "4bit",
+        load_in_8bit=args.quantization_level == "8bit",
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
+    )
+    if args.quantization_level == "none":
+        lm = AutoModelForCausalLM.from_pretrained(
+            args.model,
+            dtype=torch.bfloat16,
+            attn_implementation=attn_impl,
+            device_map=device.type,
+            low_cpu_mem_usage=True,
+        )
+    else:
+        lm = AutoModelForCausalLM.from_pretrained(
+            args.model,
+            attn_implementation=attn_impl,
+            quantization_config=bnb_config,
+            device_map=device.type,
+            low_cpu_mem_usage=True,
+        )
+
+    if args.tokenizer is not None:
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(args.model)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    tokenizer.padding_side = "left"
+
+    if args.lora_rank is not None and not args.load_checkpoint:
+        # Exclude lm_head from LoRA since we don't use it for scoring
+        # Target attention and MLP layers but not lm_head
+        lora_config = LoraConfig(
+            task_type="CAUSAL_LM",
+            target_modules=[
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+            ],
+            r=args.lora_rank,
+            lora_alpha=args.lora_rank,
+        )
+        lm = get_peft_model(lm, lora_config)
+
+        # Safety check: If embeddings are tied with lm_head, we need to be careful
+        # Most models (Gemma, Llama) don't tie embeddings, but check anyway
+        if hasattr(lm.config, "tie_word_embeddings") and lm.config.tie_word_embeddings:
+            import ipdb
+
+            ipdb.set_trace()
+            print(lm.config)
+            if accelerator.is_main_process:
+                writer.log(
+                    "WARNING: Model has tied word embeddings. Input embeddings share weights with lm_head.",
+                    level="WARNING",
+                    to_console=True,
+                )
+
+    scoring_model = model.ORCA(
+        lm,
+        score_type=args.score_type,
+        layers_to_use=args.layers_to_use,
+        use_cls_token=args.use_cls_token,
+    ).to(torch.bfloat16)
+
+    # Freeze lm_head if doing full fine-tuning (not using it for scoring)
+    # Skip if using LoRA (already excluded from target_modules)
+    # Skip if embeddings are tied (freezing lm_head would freeze embeddings too)
+    if args.lora_rank is None:
+        embeddings_tied = getattr(lm.config, "tie_word_embeddings", False)
+        if hasattr(lm, "lm_head") and not embeddings_tied:
+            for param in lm.lm_head.parameters():
+                param.requires_grad = False
+            if accelerator.is_main_process:
+                writer.log("Frozen lm_head (not used for scoring)", to_console=True)
+        elif hasattr(lm, "lm_head") and embeddings_tied:
+            if accelerator.is_main_process:
+                writer.log(
+                    "WARNING: Keeping lm_head trainable because embeddings are tied",
+                    level="WARNING",
+                    to_console=True,
+                )
+
+    # Load existing checkpoint if specified
+
+    start_step = 0
+    best_val_rho = float("-inf")
+
+    if args.load_checkpoint:
+        if accelerator.is_main_process:
+            writer.log(f"Loading model from checkpoint: {args.load_checkpoint}", to_console=True)
+        if args.lora_rank is not None:
+            lm = PeftModel.from_pretrained(lm, os.path.join(args.load_checkpoint, "lm"))
+            if accelerator.is_main_process:
+                writer.log("Loaded LoRA model from checkpoint", to_console=True)
+        else:
+            lm = AutoModel.from_pretrained(
+                os.path.join(args.load_checkpoint, "lm"),
+                dtype=torch.bfloat16,
+                attn_implementation=attn_impl,
+            )
+            if accelerator.is_main_process:
+                writer.log("Loaded LM model from checkpoint", to_console=True)
+        scoring_model = model.ORCA.load_from_directory(args.load_checkpoint, lm, device=device)
+    if args.resume:
+        if accelerator.is_main_process:
+            writer.log("Resuming from latest checkpoint", to_console=True)
+        latest_checkpoint = os.path.join(args.output_dir, "latest")
+        if args.lora_rank is not None:
+            lm = PeftModel.from_pretrained(lm, os.path.join(latest_checkpoint, "lm"))
+            if accelerator.is_main_process:
+                writer.log("Loaded LoRA model from checkpoint", to_console=True)
+        else:
+            lm = AutoModel.from_pretrained(
+                os.path.join(latest_checkpoint, "lm"),
+                torch_dtype=torch.bfloat16,
+                attn_implementation=attn_impl,
+            )
+            if accelerator.is_main_process:
+                writer.log("Loaded LM model from checkpoint", to_console=True)
+        scoring_model = model.ORCA.load_from_directory(latest_checkpoint, lm, device=device)
+        with open(os.path.join(latest_checkpoint, "metrics.yaml"), "r") as f:
+            all_metrics = yaml.safe_load(f)
+        start_step = all_metrics[-1]["step"] if all_metrics else 0
+        best_val_rho = (
+            all_metrics[-1].get("mean_rho", best_val_rho) if all_metrics else float("-inf")
+        )
+
+    return scoring_model, tokenizer, start_step, best_val_rho
+
+
+def build_optimizer_and_scheduler(args, scoring_model, accelerator, writer):
+
+    optimizer_dict_list = []
+    optimizer_dict_list.append(
+        {
+            "params": [p for p in scoring_model.lm.parameters() if p.requires_grad],
+            "lr": args.peak_lr,
+        }
+    )
+    optimizer_dict_list.append(
+        {
+            "params": scoring_model.linear.parameters(),
+            "lr": args.peak_lr * args.lr_ratio_classifier,
+        }
+    )
+    optimizer = torch.optim.AdamW(
+        optimizer_dict_list, lr=args.peak_lr, weight_decay=args.weight_decay
+    )
+    if args.resume:
+        if accelerator.is_main_process:
+            writer.log("Resuming optimizer state from checkpoint", to_console=True)
+        latest_checkpoint = os.path.join(args.output_dir, "latest")
+        optimizer.load_state_dict(torch.load(os.path.join(latest_checkpoint, "optimizer.pt")))
+    lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer, lr_lambda=partial(lr_lambda_linear_with_min_lr, args=args)
+    )
+    return optimizer, lr_scheduler
 
 
 @torch.no_grad()
@@ -384,7 +694,8 @@ def evaluate(
             "mean_rho": round(float(spearman_corr.statistic), 6),
         }
     )
-    accelerator.print(logging_dict)
+    if accelerator.is_main_process:
+        writer.log(str(logging_dict), to_console=True)
 
     # Log to JSONL (and TensorBoard if enabled)
     if accelerator.is_main_process:
@@ -398,277 +709,85 @@ def main():
     args = parse_arguments()
 
     # Set random seeds for reproducibility
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)
+    set_seeds(args.seed)
 
-    ddp_kwarg_handler = accelerate.utils.DistributedDataParallelKwargs(find_unused_parameters=True)
+    ddp_kwargs = accelerate.utils.DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = accelerate.Accelerator(
         gradient_accumulation_steps=args.accumulation_steps,
-        kwargs_handlers=[ddp_kwarg_handler],
+        kwargs_handlers=[ddp_kwargs],
     )
     torch.tensor(0).to(accelerator.device)
     device = accelerator.device
 
-    # Print arguments in two-column format
-    # args_dict = vars(args)
-    # max_key_length = max(len(str(key)) for key in args_dict.keys())
-    # accelerator.print("\n" + "=" * 100)
-    # accelerator.print(f"{'Argument':<{max_key_length + 2}} {'Value'}")
-    # accelerator.print("=" * 100)
-    # for arg, value in args_dict.items():
-    #     accelerator.print(f"{arg:<{max_key_length + 2}} {value}")
-    # accelerator.print("=" * 100 + "\n")
-
-    # Load the model and tokenizer
-    attn_impl = "flash_attention_2" if args.use_flash_attention else None
-
-    accelerator.print(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'Not Set')}")
-    accelerator.print(
-        f"Loading model {args.model} with {args.quantization_level if args.quantization_level != 'none' else 'bfloat16'} precision"
-        + (" and flash attention 2" if args.use_flash_attention else "")
-    )
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=args.quantization_level == "4bit",
-        load_in_8bit=args.quantization_level == "8bit",
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_quant_type="nf4",
-    )
-    if args.quantization_level == "none":
-        lm = AutoModelForCausalLM.from_pretrained(
-            args.model,
-            dtype=torch.bfloat16,
-            attn_implementation=attn_impl,
-            device_map=device.type,
-            low_cpu_mem_usage=True,
-        )
-    else:
-        lm = AutoModelForCausalLM.from_pretrained(
-            args.model,
-            attn_implementation=attn_impl,
-            quantization_config=bnb_config,
-            device_map=device.type,
-            low_cpu_mem_usage=True,
-        )
-
-    if args.tokenizer is not None:
-        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
-    else:
-        tokenizer = AutoTokenizer.from_pretrained(args.model)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    tokenizer.padding_side = "left"
-
-    if args.lora_rank is not None and not args.load_checkpoint:
-        lora_config = LoraConfig(
-            task_type="CAUSAL_LM",
-            target_modules="all-linear",
-            r=args.lora_rank,
-            lora_alpha=args.lora_rank,
-        )
-        lm = get_peft_model(lm, lora_config)
-
-    scoring_model = model.ORCA(
-        lm,
-        score_type=args.score_type,
-        layers_to_use=args.layers_to_use,
-        use_cls_token=args.use_cls_token,
-        init_type=args.init_type,
-    ).to(torch.bfloat16)
-
-    # accelerator.print(scoring_model)
-
-    if args.prompts_yaml is not None:
-        prompts = yaml.safe_load(open(args.prompts_yaml, "r"))
-    else:
-        prompts = None
-
-    collate_fn = data.CollateFn(tokenizer)
-    if args.dataset_sampling_weights is None:
-        train_dataset = data.ConcatenatedDataset(
-            [
-                data.UnifiedAnnotationDataset(
-                    jfile,
-                    prompts=prompts,
-                    filter_func=lambda x: len(x["text"]) <= args.max_data_length,
-                    skip_rationale=args.skip_rationale,
-                    skip_question=args.skip_question,
-                    add_transcript=args.add_transcript,
-                )
-                for jfile in args.train_data
-            ]
-        )
-        train_dataloader = DataLoader(
-            train_dataset,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=args.num_workers,
-            collate_fn=collate_fn,
-            pin_memory=True,
-        )
-    else:
-        train_datasets = [
-            data.UnifiedAnnotationDataset(
-                jfile,
-                prompts=prompts,
-                filter_func=lambda x: len(x["text"]) <= args.max_data_length,
-                skip_rationale=args.skip_rationale,
-                skip_question=args.skip_question,
-                add_transcript=args.add_transcript,
-            )
-            for jfile in args.train_data
-        ]
-
-        train_dataloaders = [
-            DataLoader(
-                train_dataset,
-                batch_size=args.batch_size,
-                shuffle=False,
-                num_workers=0,
-                collate_fn=collate_fn,
-                pin_memory=True,
-            )
-            for train_dataset in train_datasets
-        ]
-        train_dataset = data.DatasetWithSampling(
-            train_dataloaders, sampling_weights=args.dataset_sampling_weights
-        )
-        train_dataloader = DataLoader(
-            train_dataset,
-            batch_size=1,
-            shuffle=False,
-            num_workers=args.num_workers,
-            collate_fn=lambda x: x[0],
-        )
-
-    val_dataset = data.UnifiedAnnotationDataset(
-        args.val_data,
-        prompts=prompts,
-        skip_rationale=args.skip_rationale,
-        skip_question=args.skip_question,
-    )
-
-    val_dataloader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        collate_fn=collate_fn,
-    )
-
-    start_step = 0
-    best_val_rho = float("-inf")
-    all_metrics = []
-    metrics_at_best_checkpoint = []
-    train_loss = 0
-    train_count = 0
-
-    if args.load_checkpoint:
-        accelerator.print(f"Loading model from checkpoint: {args.load_checkpoint}")
-        if args.lora_rank is not None:
-            lm = PeftModel.from_pretrained(lm, os.path.join(args.load_checkpoint, "lm"))
-            accelerator.print("Loaded LoRA model from checkpoint")
-        else:
-            lm = AutoModel.from_pretrained(
-                os.path.join(args.load_checkpoint, "lm"),
-                dtype=torch.bfloat16,
-                attn_implementation=attn_impl,
-            )
-            accelerator.print("Loaded LM model from checkpoint")
-        scoring_model = model.ORCA.load_from_directory(args.load_checkpoint, lm, device=device)
-    if args.resume:
-        accelerator.print("Resuming from latest checkpoint")
-        latest_checkpoint = os.path.join(args.output_dir, "latest")
-        if args.lora_rank is not None:
-            lm = PeftModel.from_pretrained(lm, os.path.join(latest_checkpoint, "lm"))
-            accelerator.print("Loaded LoRA model from checkpoint")
-        else:
-            lm = AutoModel.from_pretrained(
-                os.path.join(latest_checkpoint, "lm"),
-                torch_dtype=torch.bfloat16,
-                attn_implementation=attn_impl,
-            )
-            accelerator.print("Loaded LM model from checkpoint")
-        scoring_model = model.ORCA.load_from_directory(latest_checkpoint, lm, device=device)
-        with open(os.path.join(latest_checkpoint, "metrics.yaml"), "r") as f:
-            all_metrics = yaml.safe_load(f)
-        start_step = all_metrics[-1]["step"] if all_metrics else 0
-        best_val_rho = (
-            all_metrics[-1].get("mean_rho", best_val_rho) if all_metrics else float("-inf")
-        )
-
-    optimizer_dict_list = []
-    optimizer_dict_list.append(
-        {
-            "params": [p for p in scoring_model.lm.parameters() if p.requires_grad],
-            "lr": args.peak_lr,
-        }
-    )
-    optimizer_dict_list.append(
-        {
-            "params": scoring_model.linear.parameters(),
-            "lr": args.peak_lr * args.lr_ratio_classifier,
-        }
-    )
-    optimizer = torch.optim.AdamW(
-        optimizer_dict_list, lr=args.peak_lr, weight_decay=args.weight_decay
-    )
-    if args.resume:
-        accelerator.print("Resuming optimizer state from checkpoint")
-        latest_checkpoint = os.path.join(args.output_dir, "latest")
-        optimizer.load_state_dict(torch.load(os.path.join(latest_checkpoint, "optimizer.pt")))
-    lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, lr_lambda=partial(lr_lambda_linear_with_min_lr, args=args)
-    )
-    scoring_model, optimizer, train_dataloader, val_dataloader = accelerator.prepare(
-        scoring_model, optimizer, train_dataloader, val_dataloader
-    )
-    accelerator.print(
-        f"Number of total parameters: {sum(p.numel()/1e6 for p in scoring_model.parameters()):.1f} M"
-    )
-    accelerator.print(
-        f"Number of trainable parameters: {sum(p.numel()/1e6 for p in scoring_model.parameters() if p.requires_grad):.1f} M"
-    )
-    accelerator.print(
-        f"Total batch size: {args.batch_size * accelerator.num_processes * args.accumulation_steps} ",
-        f"({accelerator.num_processes} processes, ",
-        f"per process: {args.batch_size}, accumulation steps: {args.accumulation_steps})",
-    )
-    accelerator.print(f"Total number of training samples: {len(train_dataset)}")
-    accelerator.print(f"Total number of validation samples: {len(val_dataset)}")
-
     # Generate or use provided experiment name
-    if accelerator.is_main_process:
-        if args.exp_name:
-            exp_name = args.exp_name
-        else:
-            model_name = args.model.split("/")[-1]
-            effective_batch = args.batch_size * args.accumulation_steps * accelerator.num_processes
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            exp_name = (
-                f"{model_name}_{args.score_type}_lr{args.peak_lr}_bs{effective_batch}__{timestamp}"
-            )
+    if not args.exp_name:
+        model_name = args.model.split("/")[-1]
+        effective_batch = args.batch_size * args.accumulation_steps * accelerator.num_processes
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        args.exp_name = (
+            f"{model_name}_{args.score_type}_lr{args.peak_lr}_bs{effective_batch}__{timestamp}"
+        )
 
-        jsonl_log_path = os.path.join(args.output_dir, "training_log.jsonl")
-        tensorboard_dir = os.path.join(args.log_dir, exp_name) if args.log_dir else None
-
-        writer = CompositeWriter(log_dir=tensorboard_dir, jsonl_path=jsonl_log_path)
-
-        accelerator.print(f"Experiment name: {exp_name}")
-        accelerator.print(f"TensorBoard logs: {tensorboard_dir}")
-
-    else:
-        writer = CompositeWriter(log_dir=None, jsonl_path=None)
-
-    train_loader_iter = iter(train_dataloader)
     os.makedirs(args.output_dir, exist_ok=True)
     args_dict = {arg: getattr(args, arg) for arg in vars(args)}
     if not os.path.exists(os.path.join(args.output_dir, "args.yaml")):
         with open(os.path.join(args.output_dir, "args.yaml"), "w") as f:
             yaml.dump(args_dict, f)
+
+    # Create writer for logging
+    jsonl_log_path = os.path.join(args.output_dir, "training_metrics.jsonl")
+    tensorboard_dir = os.path.join(args.log_dir, args.exp_name) if args.log_dir else None
+    writer = CompositeWriter(
+        log_dir=tensorboard_dir,
+        jsonl_path=jsonl_log_path,
+        resume=args.resume,
+        console_print_fn=accelerator.print,
+    )
+
+    writer.log(f"Platform: {platform.node()} {platform.platform()}", to_console=True)
+    writer.log(f"Experiment name: {args.exp_name}", to_console=True)
+    writer.log(f"TensorBoard logs: {tensorboard_dir}", to_console=True)
+    writer.log(f"Training log: {writer.text_log_path}", to_console=True)
+
+    # Log initial configuration (only main process writes)
+    if accelerator.is_main_process:
+        writer.log(" ".join(sys.argv))
+
+    # Build model and tokenizer - load from checkpoint if specified
+    scoring_model, tokenizer, start_step, best_val_rho = build_model(
+        args, accelerator, device, writer
+    )
+    writer.log(scoring_model)
+
+    # Create datasets and dataloaders
+    train_dataloader, val_dataloader = get_dataloaders(args, tokenizer, writer)
+
+    optimizer, lr_scheduler = build_optimizer_and_scheduler(
+        args, scoring_model, accelerator, writer
+    )
+
+    scoring_model, optimizer, train_dataloader, val_dataloader = accelerator.prepare(
+        scoring_model, optimizer, train_dataloader, val_dataloader
+    )
+
+    total_params = sum(p.numel() / 1e6 for p in scoring_model.parameters())
+    trainable_params = sum(p.numel() / 1e6 for p in scoring_model.parameters() if p.requires_grad)
+    total_batch_size = args.batch_size * accelerator.num_processes * args.accumulation_steps
+
+    # Log model and training configuration to file
+    if accelerator.is_main_process:
+        write_to_log(args, total_params, trainable_params, total_batch_size, writer, accelerator)
+
+        if args.resume:
+            writer.log(f"RESUMING FROM CHECKPOINT (step {start_step})", to_console=True)
+            writer.log(f"Best validation rho so far: {best_val_rho:.6f}", to_console=True)
+
+    all_metrics = []
+    metrics_at_best_checkpoint = []
+    train_loss = 0
+    train_count = 0
+
+    train_loader_iter = iter(train_dataloader)
     scoring_model.train()
 
     for j in tqdm.tqdm(
@@ -693,25 +812,30 @@ def main():
 
                 # Check for abnormally high loss and log diagnostics
                 if loss.item() > 1000 or torch.isnan(loss) or torch.isinf(loss):
-                    accelerator.print(
-                        f"WARNING: High/invalid loss detected at step {j}, accumulation {k+1}!"
-                    )
-                    accelerator.print(f"  Loss: {loss.item()}")
-                    if "params" in outputs:
-                        params = outputs["params"]
-                        concentrations = params.exp()
-                        accelerator.print(
-                            f"  Concentration1 range: [{concentrations[:, 0].min().item():.4f}, {concentrations[:, 0].max().item():.4f}]"
+                    if accelerator.is_main_process:
+                        writer.log(
+                            f"WARNING: High/invalid loss detected at step {j}, accumulation {k+1}!",
+                            level="WARNING",
                         )
-                        accelerator.print(
-                            f"  Concentration0 range: [{concentrations[:, 1].min().item():.4f}, {concentrations[:, 1].max().item():.4f}]"
-                        )
-                    if "labels" in batch:
-                        valid_labels = batch["labels"][batch["labels"] >= 0]
-                        if len(valid_labels) > 0:
-                            accelerator.print(
-                                f"  Label range: [{valid_labels.min().item():.4f}, {valid_labels.max().item():.4f}]"
+                        writer.log(f"  Loss: {loss.item()}", level="WARNING")
+                        if "params" in outputs:
+                            params = outputs["params"]
+                            concentrations = params.exp()
+                            writer.log(
+                                f"  Concentration1 range: [{concentrations[:, 0].min().item():.4f}, {concentrations[:, 0].max().item():.4f}]",
+                                level="WARNING",
                             )
+                            writer.log(
+                                f"  Concentration0 range: [{concentrations[:, 1].min().item():.4f}, {concentrations[:, 1].max().item():.4f}]",
+                                level="WARNING",
+                            )
+                        if "labels" in batch:
+                            valid_labels = batch["labels"][batch["labels"] >= 0]
+                            if len(valid_labels) > 0:
+                                writer.log(
+                                    f"  Label range: [{valid_labels.min().item():.4f}, {valid_labels.max().item():.4f}]",
+                                    level="WARNING",
+                                )
 
                 accelerator.backward(loss)
 
@@ -786,6 +910,11 @@ def main():
                     tokenizer=tokenizer,
                 )
                 metrics_at_best_checkpoint = logging_dict
+                if accelerator.is_main_process:
+                    writer.log(
+                        f"Step {j}: New best validation rho: {best_val_rho:.6f} - Saved checkpoint to 'best'",
+                        to_console=True,
+                    )
             if accelerator.is_main_process:
                 save_checkpoint(
                     scoring_model,
@@ -806,6 +935,7 @@ def main():
                 args=args,
                 tokenizer=tokenizer,
             )
+            writer.log(f"Step {j}: Saved periodic checkpoint to 'checkpoint_{j}'")
 
         scoring_model.train()
 
@@ -814,11 +944,26 @@ def main():
         if len(all_val_rhos) > args.early_stopping_patience and all(
             v < max(all_val_rhos) for v in recent_val_rho
         ):
-            accelerator.print("Early stopping")
+            if accelerator.is_main_process:
+                writer.log(f"EARLY STOPPING at step {j}", to_console=True)
+                writer.log(
+                    f"No improvement in validation rho for {args.early_stopping_patience} validation steps",
+                    to_console=True,
+                )
+                writer.log(f"Best validation rho: {max(all_val_rhos):.6f}", to_console=True)
+
             break
 
-    accelerator.print("Training finished. Metrics at best step:")
-    accelerator.print(metrics_at_best_checkpoint)
+    if accelerator.is_main_process:
+        writer.log("== TRAINING COMPLETED ==", to_console=True)
+        writer.log(
+            f"Training finished at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", to_console=True
+        )
+        writer.log(f"Total steps: {j}", to_console=True)
+        writer.log("\nBest checkpoint metrics:", to_console=True)
+        for key, value in metrics_at_best_checkpoint.items():
+            writer.log(f"  {key}: {value}", to_console=True)
+        writer.close()
 
 
 if __name__ == "__main__":

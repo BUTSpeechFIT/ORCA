@@ -12,7 +12,7 @@
 
 > **Status:** Paper under review for TACL (Transactions of the Association for Computational Linguistics)
 
-ORCA is a framework for assessing the quality of open-ended responses, particularly for audio question-answering tasks. The system uses language model representations with Beta distribution modeling to capture both the mean quality and uncertainty (variance) of responses based on multiple human annotations.
+ORCA is a framework for assessing the correctness of open-ended responses, particularly for audio question-answering tasks. The system uses language model representations and models the correctness of a response using Beta distribution thereby capturing both the mean and uncertainty (variance) of correctness score. The ORCA score strongly correlates with average human judgement and effectively captures the interpretive uncertainty.
 
 ## Coming Soon
 
@@ -29,9 +29,31 @@ ORCA is a framework for assessing the quality of open-ended responses, particula
 
 ## Installation
 
+### Using uv (recommended)
+
+```bash
+# Install uv if not already installed
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Create and activate a virtual environment with Python 3.12+
+uv venv --python 3.12
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+
+# Install ORCA
+uv pip install -e .
+
+# For development (includes black, ruff, isort, pytest, etc.)
+uv pip install -e ".[dev]"
+```
+
+### Using pip
+
 ```bash
 # Python 3.12+ required
 pip install -e .
+
+# For development
+pip install -e ".[dev]"
 ```
 
 ## Quick Start
@@ -39,7 +61,7 @@ pip install -e .
 ### Training
 
 ```bash
-python -m orca_score.train \
+orca-train \
     --train_data path/to/train.json \
     --val_data path/to/val.json \
     --model google/gemma-3-1b-it \
@@ -52,16 +74,18 @@ python -m orca_score.train \
 ### Inference
 
 ```bash
-python -m orca_score.infer \
-    --model_path ./output/best \
+orca-infer \
+    --model_path ./output/best/model \
     --data path/to/test.json \
     --output_dir ./results
 ```
 
+> **Note:** You can also use Python module syntax: `python -m orca_score.train` and `python -m orca_score.infer`
+
 ## Model Architecture
 
 ORCA uses a pre-trained language model (e.g., Gemma, Llama, OLMo) with a linear scoring head that outputs log(α) and log(β) parameters for a Beta distribution. The Beta distribution captures:
-- **Mean quality**: E[score] = α / (α + β)
+- **Mean correctness score**: E[score] = α / (α + β)
 - **Uncertainty/Variance**: Var[score] = (α·β) / ((α+β)²·(α+β+1))
 
 ## Key Arguments
@@ -86,6 +110,7 @@ orca_score/
 ├── train.py       # Training script
 ├── infer.py       # Inference script
 ├── data.py        # Dataset and data loading utilities
+├── cli.py         # Command-line interface (orca-train, orca-infer)
 └── utils.py       # Helper functions
 
 tex/               # LaTeX source for TACL paper
@@ -120,4 +145,4 @@ For questions or issues, please contact the corresponding authors:
 
 **Primary Institution:** Speech@FIT, Brno University of Technology, Czechia
 
-**Project Page:** https://github.com/BUTSpeechFIT/Orca
+**Project Page:** https://github.com/BUTSpeechFIT/ORCA
