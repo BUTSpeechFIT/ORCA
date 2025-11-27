@@ -28,13 +28,13 @@ from orca_score.utils import CompositeWriter, save_checkpoint
 
 
 def write_to_log(args, total_params, trainable_params, total_batch_size, writer, accelerator):
+    """Write model and training configuration to log file."""
 
     writer.log("== MODEL CONFIGURATION ==")
     writer.log(f"Model: {args.model}")
     writer.log(f"Score type: {args.score_type}")
     writer.log(f"Quantization: {args.quantization_level}")
     writer.log(f"LoRA rank: {args.lora_rank if args.lora_rank else 'None (full fine-tuning)'}")
-    writer.log(f"Layers to use: {args.layers_to_use if args.layers_to_use else 'All'}")
     writer.log(f"Use CLS token: {args.use_cls_token}")
     writer.log(f"Flash Attention 2: {args.use_flash_attention}")
     writer.log(f"Total parameters: {total_params:.1f}M", to_console=True)
@@ -75,6 +75,7 @@ def set_seeds(seed):
 
 
 def lr_lambda_linear_with_min_lr(step, args):
+    """Linear learning rate scheduler with minimum learning rate ratio."""
     peak_lr = args.peak_lr
     min_lr = peak_lr * args.min_lr_ratio
     if step < args.warmup_steps:
@@ -146,17 +147,12 @@ def parse_arguments():
     )
 
     model_group = parser.add_argument_group("Model related arguments")
-    model_group.add_argument(
-        "--score_type",
-        type=str,
-        default="beta",
-        choices=["bernoulli", "beta", "mse", "bmm"],
-        help="Type of scoring to use for training the model.",
-    )
+
+    # Core architecture
     model_group.add_argument(
         "--model",
         type=str,
-        default="google/gemma-3-1b-it",
+        default="allenai/OLMo-2-0425-1B-Instruct",
         help="LLM to initialize from.",
     )
     model_group.add_argument(
@@ -165,13 +161,19 @@ def parse_arguments():
         help="Path to the tokenizer directory. Defaults to model if unset",
     )
     model_group.add_argument(
-        "--layers_to_use",
-        nargs="+",
-        type=int,
-        default=[-1],
-        help="List of layer indices to use for scoring. If not provided, all layers will be used.",
+        "--score_type",
+        type=str,
+        default="beta",
+        choices=["bernoulli", "beta"],
+        help="Type of scoring to use for training the model.",
+    )
+    model_group.add_argument(
+        "--use_cls_token",
+        action="store_true",
+        help="If set, the model will append a CLS token for scoring.",
     )
 
+    # Optimization and efficiency
     model_group.add_argument("--lora_rank", type=int, help="LoRA rank, default is no LoRA")
     model_group.add_argument(
         "--quantization_level",
@@ -181,18 +183,23 @@ def parse_arguments():
         help="Quantization level to use for the model.",
     )
     model_group.add_argument(
-        "--use_cls_token",
-        action="store_true",
-        help="If set, the model will append a CLS token for scoring.",
-    )
-    model_group.add_argument(
         "--use_flash_attention",
         action="store_true",
         help="If set, the model will use Flash Attention 2 for faster attention computation. Requires flash-attn package.",
     )
 
+    # Initialization
+    model_group.add_argument(
+        "--init_type",
+        type=str,
+        default="xavier_normal",
+        choices=["xavier_normal", "kaiming_normal"],
+        help="Initialization method for the linear scoring layer that outputs log(alpha), log(beta).",
+    )
+
     training_group = parser.add_argument_group("Training related arguments")
 
+    # Checkpointing and resume
     training_group.add_argument(
         "--load_checkpoint",
         type=str,
@@ -205,6 +212,29 @@ def parse_arguments():
         help="Whether to resume training from the latest checkpoint.",
     )
 
+    # I/O paths
+    training_group.add_argument(
+        "--output_dir",
+        type=str,
+        default="./output",
+        required=True,
+        help="Directory to save the trained model.",
+    )
+    training_group.add_argument(
+        "--log_dir",
+        type=str,
+        default="./logs",
+        required=True,
+        help="Directory to save logs for TensorBoard.",
+    )
+    training_group.add_argument(
+        "--exp_name",
+        type=str,
+        default=None,
+        help="Experiment name for logging. If not provided, will be auto-generated from hyperparameters.",
+    )
+
+    # Training schedule
     training_group.add_argument(
         "--max_steps", type=int, default=4000, help="Number of training steps."
     )
@@ -215,20 +245,27 @@ def parse_arguments():
         "--save_steps", type=int, default=500, help="Number of steps between saves."
     )
     training_group.add_argument(
-        "--batch_size", type=int, default=1, help="Batch size for training."
+        "--log_steps", type=int, default=50, help="Number of steps between logging training loss."
+    )
+    training_group.add_argument(
+        "--early_stopping_patience",
+        type=int,
+        default=30,
+        help="Number of validation steps without improvement before early stopping.",
+    )
+
+    # Batch size and accumulation
+    training_group.add_argument(
+        "--batch_size", type=int, default=8, help="Batch size for training."
     )
     training_group.add_argument(
         "--accumulation_steps",
         type=int,
-        default=4,
+        default=1,
         help="Number of gradient accumulation steps.",
     )
-    training_group.add_argument(
-        "--warmup_steps",
-        type=int,
-        default=100,
-        help="Number of warmup steps for learning rate.",
-    )
+
+    # Optimization hyperparameters
     training_group.add_argument(
         "--peak_lr", type=float, default=5e-5, help="Peak learning rate for training."
     )
@@ -237,6 +274,18 @@ def parse_arguments():
         type=float,
         default=0.01,
         help="Minimum learning rate ratio relative to peak learning rate.",
+    )
+    training_group.add_argument(
+        "--lr_ratio_classifier",
+        type=float,
+        default=1.0,
+        help="Learning rate ratio for the classifier head relative to the LM.",
+    )
+    training_group.add_argument(
+        "--warmup_steps",
+        type=int,
+        default=100,
+        help="Number of warmup steps for learning rate.",
     )
     training_group.add_argument(
         "--weight_decay", type=float, default=0, help="Weight decay for optimizer."
@@ -248,41 +297,9 @@ def parse_arguments():
         help="Maximum gradient norm for clipping.",
     )
 
-    training_group.add_argument(
-        "--early_stopping_patience",
-        type=int,
-        default=30,
-        help="Number of validation steps without improvement before early stopping.",
-    )
-    training_group.add_argument(
-        "--lr_ratio_classifier",
-        type=float,
-        default=1.0,
-        help="Learning rate ratio for the classifier head relative to the LM.",
-    )
-
+    # Miscellaneous
     training_group.add_argument(
         "--num_workers", type=int, default=0, help="Number of workers for data loading."
-    )
-    training_group.add_argument(
-        "--log_dir",
-        type=str,
-        default="./logs",
-        required=True,
-        help="Directory to save logs for TensorBoard.",
-    )
-    training_group.add_argument(
-        "--output_dir",
-        type=str,
-        default="./output",
-        required=True,
-        help="Directory to save the trained model.",
-    )
-    training_group.add_argument(
-        "--exp_name",
-        type=str,
-        default=None,
-        help="Experiment name for logging. If not provided, will be auto-generated from hyperparameters.",
     )
     training_group.add_argument(
         "--seed",
@@ -290,7 +307,6 @@ def parse_arguments():
         default=108,
         help="Random seed for reproducibility.",
     )
-
     training_group.add_argument(
         "--verbose",
         action="store_true",
@@ -329,7 +345,7 @@ def get_dataloaders(args, tokenizer, writer):
         train_dataloader = DataLoader(
             train_dataset,
             batch_size=args.batch_size,
-            shuffle=False,
+            shuffle=True,
             num_workers=args.num_workers,
             collate_fn=collate_fn,
             pin_memory=True,
@@ -352,7 +368,7 @@ def get_dataloaders(args, tokenizer, writer):
             DataLoader(
                 train_dataset,
                 batch_size=args.batch_size,
-                shuffle=False,
+                shuffle=True,
                 num_workers=0,
                 collate_fn=collate_fn,
                 pin_memory=True,
@@ -365,7 +381,7 @@ def get_dataloaders(args, tokenizer, writer):
         train_dataloader = DataLoader(
             train_dataset,
             batch_size=1,
-            shuffle=False,
+            shuffle=True,
             num_workers=args.num_workers,
             collate_fn=lambda x: x[0],
         )
@@ -381,7 +397,7 @@ def get_dataloaders(args, tokenizer, writer):
     val_dataloader = DataLoader(
         val_dataset,
         batch_size=args.batch_size,
-        shuffle=False,
+        shuffle=True,
         num_workers=args.num_workers,
         collate_fn=collate_fn,
     )
@@ -393,6 +409,7 @@ def get_dataloaders(args, tokenizer, writer):
 
 
 def build_model(args, accelerator, device, writer):
+    """Build the ORCA model and tokenizer, loading from checkpoint if specified."""
 
     # Load the model and tokenizer
     attn_impl = "flash_attention_2" if args.use_flash_attention else None
@@ -471,8 +488,8 @@ def build_model(args, accelerator, device, writer):
     scoring_model = model.ORCA(
         lm,
         score_type=args.score_type,
-        layers_to_use=args.layers_to_use,
         use_cls_token=args.use_cls_token,
+        init_type=args.init_type,
     ).to(torch.bfloat16)
 
     # Freeze lm_head if doing full fine-tuning (not using it for scoring)
@@ -576,11 +593,13 @@ def evaluate(
     val_dataloader,
     accelerator,
     logging_dict,
-    j,
+    step,
     writer,
     best_val_rho,
     args,
 ):
+    """Evaluate the model on the validation set and log metrics."""
+
     device = accelerator.device
 
     val_loss = 0
@@ -627,7 +646,7 @@ def evaluate(
     with open(
         os.path.join(
             args.output_dir,
-            f"val_predictions_{j}_{accelerator.process_index}.yaml",
+            f"val_predictions_{step}_{accelerator.process_index}.yaml",
         ),
         "w",
     ) as f:
@@ -649,7 +668,7 @@ def evaluate(
     all_val_variance_annotations = []
     all_val_variance_predictions = []
     for i in range(accelerator.num_processes):
-        with open(os.path.join(args.output_dir, f"val_predictions_{j}_{i}.yaml"), "r") as f:
+        with open(os.path.join(args.output_dir, f"val_predictions_{step}_{i}.yaml"), "r") as f:
             result_data = yaml.safe_load(f)
             all_val_annotations.extend(result_data["annotations"])
             all_val_predictions.extend(result_data["predictions"])
@@ -665,23 +684,23 @@ def evaluate(
     variance_spearman_corr = spearmanr(all_val_variance_annotations, all_val_variance_predictions)
 
     if accelerator.is_main_process:
-        writer.add_scalar("Loss/val_loss_mean", val_loss / val_num_samples, j)
-        writer.add_scalar(f"Loss/val_loss_mean_{args.score_type}", val_loss / val_num_samples, j)
-        writer.add_scalar("Correlations/Mean Kendall's Tau", float(kendall_tau.statistic), j)
+        writer.add_scalar("Loss/val_loss_mean", val_loss / val_num_samples, step)
+        writer.add_scalar(f"Loss/val_loss_mean_{args.score_type}", val_loss / val_num_samples, step)
+        writer.add_scalar("Correlations/Mean Kendall's Tau", float(kendall_tau.statistic), step)
         writer.add_scalar(
             "Correlations/Mean Spearman's Rank Correlation",
             float(spearman_corr.statistic),
-            j,
+            step,
         )
         writer.add_scalar(
             "Correlations/Variance Kendall's Tau",
             float(variance_kendall_tau.statistic),
-            j,
+            step,
         )
         writer.add_scalar(
             "Correlations/Variance Spearman's Rank Correlation",
             float(variance_spearman_corr.statistic),
-            j,
+            step,
         )
 
     logging_dict.update(
@@ -874,6 +893,12 @@ def main():
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
 
+        if j % args.log_steps == 0 and accelerator.is_main_process and train_count > 0:
+            writer.log(
+                f"Step {j}: Training loss: {train_loss/train_count:.4f} Learning Rate: {optimizer.param_groups[0]['lr']:.6e}",
+                to_console=True,
+            )
+
         if accelerator.is_main_process and train_count > 0:
             writer.add_scalar("Loss/train_loss", train_loss / train_count, j)
             writer.add_scalar("Learning Rate", optimizer.param_groups[0]["lr"], j)
@@ -886,7 +911,11 @@ def main():
 
             scoring_model.eval()
 
-            logging_dict = {"step": j, "train_loss": round(train_loss / train_count, 6)}
+            logging_dict = {
+                "step": j,
+                "train_loss": round(train_loss / train_count, 6),
+                "lr": optimizer.param_groups[0]["lr"],
+            }
 
             spearman_corr, logging_dict = evaluate(
                 scoring_model,
@@ -960,9 +989,10 @@ def main():
             f"Training finished at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", to_console=True
         )
         writer.log(f"Total steps: {j}", to_console=True)
-        writer.log("\nBest checkpoint metrics:", to_console=True)
-        for key, value in metrics_at_best_checkpoint.items():
-            writer.log(f"  {key}: {value}", to_console=True)
+        if metrics_at_best_checkpoint:
+            writer.log("\nBest checkpoint metrics:", to_console=True)
+            for key, value in metrics_at_best_checkpoint.items():
+                writer.log(f"  {key}: {value}", to_console=True)
         writer.close()
 
 

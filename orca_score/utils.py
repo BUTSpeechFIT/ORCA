@@ -3,7 +3,6 @@
 import json
 import logging
 import os
-from datetime import datetime
 
 import torch
 import yaml
@@ -22,17 +21,6 @@ class CompositeWriter(SummaryWriter):
         resume: If True, appends to existing log. If False, rotates old log file.
         console_print_fn: Callable for console output. Defaults to print(). Pass accelerator.print for distributed training.
         **kwargs: Additional arguments passed to SummaryWriter.
-
-    Example:
-        >>> writer = CompositeWriter(log_dir="./logs", jsonl_path="./training.jsonl")
-        >>> writer.add_scalar("loss", 0.5, step=1)
-        >>> writer.add_hparams({}, {"loss": 0.5, "acc": 0.9})
-        >>> writer.log("Training started")  # File only
-        >>> writer.log("Model loaded", to_console=True)  # File + console
-        >>>
-        >>> # For distributed training:
-        >>> writer = CompositeWriter(log_dir="./logs", jsonl_path="./training.jsonl",
-        ...                          console_print_fn=accelerator.print)
     """
 
     def __init__(

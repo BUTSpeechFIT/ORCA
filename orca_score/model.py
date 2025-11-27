@@ -38,37 +38,6 @@ def bernoulli_kl(logits, labels):
     )
 
 
-def mse_loss(logits, labels):
-    """
-    Compute the mean squared error loss between the logits and the labels.
-    :param logits: Tensor of shape (batch_size, num_classes)
-    :param labels: Tensor of shape (batch_size,)
-    :return: Tensor of shape (batch_size,)
-    """
-    original_dtype = logits.dtype
-    logits = logits.float()  # Ensure logits are float for numerical stability
-    probs = torch.nn.functional.softmax(logits, dim=-1)
-    if labels is not None:
-        # Average ratings across judges.
-        # Just takes the mean of the ratings while accounting the fact that different questions may have different number of ratings
-        labels1 = labels.float()
-        labels1_mask = labels1 >= 0
-        labels1 = labels1.masked_fill(~labels1_mask, 0)
-        labels1 = labels1.sum(dim=-1, keepdim=True) / labels1_mask.sum(dim=-1, keepdim=True).clamp(
-            min=1e-8
-        )  # Avoid division by zero
-        # labels0 = 1 - labels1
-
-        mse = (labels1 - probs[:, 0]) ** 2
-    else:
-        mse = None
-    return (
-        mse,
-        probs[..., 0].to(original_dtype),
-        torch.zeros_like(logits[..., 0]).to(original_dtype),
-    )
-
-
 def beta_llh(params, labels, eps=1e-2):
     """
     Compute the log likelihood of the labels given the logits for a binary classification.
@@ -100,47 +69,6 @@ def beta_llh(params, labels, eps=1e-2):
         negative_log_probs,
         (concentration1 / (concentration1 + concentration0)).to(original_dtype),
         # (concentration1 - 1)/(concentration0 + concentration1 - 2).to(original_dtype),
-        (concentration0 * concentration1)
-        / ((concentration1 + concentration0 + 1) * ((concentration1 + concentration0) ** 2)).to(
-            original_dtype
-        ),
-    )
-
-
-def beta_moment_matching(params, labels, eps=1e-2):
-    """
-    Compute the log likelihood of the labels given the logits for a binary classification.
-    :param params: Tensor of shape (batch_size, 2)
-    :param labels: Tensor of shape (batch_size,)
-    :return: Tensor of shape (batch_size,)
-    """
-    original_dtype = params.dtype
-    params_float: torch.Tensor = params.float()
-    params_exp = params_float.exp()
-    concentration1 = params_exp[:, 0]
-    concentration0 = params_exp[:, 1]
-
-    # beta_distribution = torch.distributions.Beta(
-    #    concentration1.unsqueeze(-1), concentration0.unsqueeze(-1)
-    # )
-    if labels is not None:
-        labels = labels.clamp(min=eps, max=1 - eps)  # Avoid infs in the beta pdf
-        labels_mean = labels.mean(
-            dim=-1,
-        )
-        labels_variance = labels.var(dim=-1, unbiased=False)
-        predicted_mean = concentration1 / (concentration1 + concentration0)
-        predicted_variance = (concentration0 * concentration1) / (
-            (concentration1 + concentration0 + 1) * ((concentration1 + concentration0) ** 2)
-        )
-        moments_difference = (predicted_mean - labels_mean) ** 2 + (
-            predicted_variance - labels_variance
-        ) ** 2
-    else:
-        moments_difference = None
-    return (
-        moments_difference,
-        (concentration1 / (concentration1 + concentration0)).to(original_dtype),
         (concentration0 * concentration1)
         / ((concentration1 + concentration0 + 1) * ((concentration1 + concentration0) ** 2)).to(
             original_dtype
@@ -189,26 +117,23 @@ def bernoulli_params_kl(params_p, params_q):
 
 
 class ORCA(torch.nn.Module):
+    """ORCA model"""
+
     def __init__(
         self,
         lm,
         score_type="beta",
-        layers_to_use=(-1,),
         use_cls_token=False,
+        init_type="xavier_normal",
     ):
         """
         Initialize the ORCA model (formerly MEME).
-        :param lm: pre-trained language model (e.g., Gemma, Llama, etc.)
+        :param lm: pre-trained language model (e.g., Gemma, Llama, etc.).
         :param score_type: Type of scoring function to use, either 'bernoulli' or 'beta'.
-        :param layers_to_use: List of layer concatenate as input to the scorer. If None, all layers will be used.
+        :param use_cls_token: Whether to append a learnable CLS token.
+        :param init_type: Initialization method for linear layer. Options: 'xavier_normal', 'kaiming_normal', 'uniform_beta'.
         """
         super().__init__()
-        if layers_to_use is None:
-            if hasattr(lm.config, "text_config"):  # For larger Gemma models
-                layers_to_use = list(range(lm.config.text_config.num_hidden_layers))
-            else:
-                layers_to_use = list(range(lm.config.num_hidden_layers))
-        self.layers_to_use = layers_to_use
         self.lm = lm
         self.use_cls_token = use_cls_token
         if hasattr(lm.config, "text_config"):
@@ -219,36 +144,44 @@ class ORCA(torch.nn.Module):
             self.cls_token = torch.nn.Parameter(torch.randn(lm_hidden_size))
         else:
             self.cls_token = None
-        self.linear = torch.nn.Linear(lm_hidden_size * len(self.layers_to_use), 2)
-        # self._init_linear()
+        self.linear = torch.nn.Linear(lm_hidden_size, 2)
+        self.init_type = init_type
+        self._init_linear()
 
         self.score_type = score_type
         self.scoring_function = {
             "bernoulli": bernoulli_kl,
             "beta": beta_llh,
-            "mse": mse_loss,
-            "bmm": beta_moment_matching,
         }.get(
             score_type, "beta"
         )  # defaults to Beta if unknown score_type
         self.param_kl_function = {
             "bernoulli": bernoulli_params_kl,
             "beta": beta_params_kl,
-            "mse": beta_params_kl,
-            "bmm": beta_params_kl,
         }.get(score_type)
         self.config = {
             "score_type": self.score_type,
-            "layers_to_use": self.layers_to_use,
             "use_cls_token": self.use_cls_token,
+            "init_type": self.init_type,
         }
 
     def _init_linear(self):
         """
-        Initialize the linear layer with Xavier normal initialization.
+        Initialize the linear layer for outputting log(alpha) and log(beta) of Beta distribution.
         """
-        torch.nn.init.xavier_normal_(self.linear.weight, gain=0.01)
-        torch.nn.init.constant_(self.linear.bias, 0.0)
+        if self.init_type == "xavier_normal":
+            torch.nn.init.xavier_normal_(self.linear.weight, gain=0.01)
+            torch.nn.init.constant_(self.linear.bias, 0.0)
+
+        elif self.init_type == "kaiming_normal":
+            torch.nn.init.kaiming_normal_(self.linear.weight, mode="fan_in", nonlinearity="linear")
+            self.linear.weight.data *= 0.01
+            torch.nn.init.constant_(self.linear.bias, 0.1)
+
+        else:
+            raise ValueError(
+                f"Unknown init_type: {self.init_type}. Choose from ['xavier_normal', 'kaiming_normal']"
+            )
 
     def forward(self, x, prior_params=None):
         input_ids, input_lengths = x["input_ids"], x["input_len"]
@@ -262,7 +195,7 @@ class ORCA(torch.nn.Module):
             output_hidden_states=True,
             attention_mask=x["attention_mask"],
         )
-        hidden_states = [model_outputs.hidden_states[i] for i in self.layers_to_use]
+        hidden_states = [model_outputs.hidden_states[-1]]
         hidden_states = [
             hd[torch.arange(hd.shape[0]), input_lengths - 1, :] for hd in hidden_states
         ]
@@ -322,7 +255,8 @@ class ORCA(torch.nn.Module):
         model = cls(
             lm=lm,
             score_type=config["score_type"],
-            layers_to_use=config["layers_to_use"],
+            use_cls_token=config.get("use_cls_token", False),
+            init_type=config.get("init_type", "xavier_normal"),
         )
         model.lm = lm
         model.load_state_dict(
