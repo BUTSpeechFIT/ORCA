@@ -72,7 +72,8 @@ orca-train \
 orca-infer \
     --model_path ./output/best/model \
     --data data/seed_108/test.json \
-    --output_dir ./results
+    --output_dir ./results \
+    --test_set_is_labeled
 ```
 
 ## Model Architecture
