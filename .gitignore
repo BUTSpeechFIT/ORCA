@@ -1,0 +1,12 @@
+exp
+.cache
+misc
+tex
+
+*.*~
+*.sh
+
+__pycache__
+
+.venv
+.vscode

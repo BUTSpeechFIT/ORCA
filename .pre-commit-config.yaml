@@ -1,0 +1,29 @@
+default_stages: [commit, push]
+default_language_version:
+  python: python3.12
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: check-yaml
+        args: [--allow-multiple-documents, --unsafe]
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+        exclude: ^.*\.(md|rst)$
+      - id: mixed-line-ending
+      - id: check-merge-conflict
+  - repo: https://github.com/psf/black
+    rev: 24.3.0
+    hooks:
+    - id: black
+      args: [
+        --line-length=100,
+        --target-version=py312
+      ]
+      exclude: ^(venv/|docs/)
+      types: ['python']
+  - repo: https://github.com/PyCQA/isort
+    rev: 5.13.2
+    hooks:
+      - id: isort
+        args: [--profile=black]
