@@ -1,8 +1,6 @@
 # 🐋 ORCA: Open-ended Response Correctness Assessment for Audio Question Answering
 
-**Authors:** Šimon Sedláček¹\*, Sara Barahona²\*, Bolaji Yusuf¹\*, Cecilia Bolaños³\*, Laura Herrera-Alarcón²\*, Santosh Kesiraju¹\*, Alicia Lozano-Diez²\*, Sathvik Udupa¹, Fernando López², Allison Ferner⁴, Ramani Duraiswami⁵, Jan Černocký¹
-
-\* Equal contribution
+**Authors:** Šimon Sedláček¹, Sara Barahona², Bolaji Yusuf¹, Cecilia Bolaños³, Laura Herrera-Alarcón², Santosh Kesiraju¹, Alicia Lozano-Diez², Sathvik Udupa¹, Fernando López², Allison Ferner⁴, Ramani Duraiswami⁵, Jan Černocký¹
 
 ¹Speech@FIT, Brno University of Technology, Czechia.
 ²Universidad Autónoma de Madrid, Spain. \
@@ -150,6 +148,3 @@ For questions or issues, please contact the corresponding authors:
 - **Bolaji Yusuf** - iyusuf@fit.vut.cz
 - **Santosh Kesiraju** - kesiraju@fit.vut.cz
 
-**Primary Institution:** Speech@FIT, Brno University of Technology, Czechia
-
-**Project Page:** https://github.com/BUTSpeechFIT/ORCA
