@@ -1,6 +1,6 @@
 # 🐋 ORCA: Open-ended Response Correctness Assessment for Audio Question Answering
 
-**Authors:** Šimon Sedláček¹\*, Sara Barahona²\*, Bolaji Yusuf¹\*, Laura Herrera-Alarcón²\*, Santosh Kesiraju¹\*, Cecilia Bolaños³, Alicia Lozano-Diez², Sathvik Udupa¹, Fernando López², Allison Ferner⁴, Ramani Duraiswami⁵, Jan Černocký¹
+**Authors:** Šimon Sedláček¹\*, Sara Barahona²\*, Bolaji Yusuf¹\*, Cecilia Bolaños³\*, Laura Herrera-Alarcón²\*, Santosh Kesiraju¹\*, Alicia Lozano-Diez²\*, Sathvik Udupa¹, Fernando López², Allison Ferner⁴, Ramani Duraiswami⁵, Jan Černocký¹
 
 \* Equal contribution
 
