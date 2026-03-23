@@ -6,7 +6,7 @@ import torch
 import yaml
 
 
-def bernoulli_kl(logits, labels):
+def bernoulli_kl(logits: torch.Tensor, labels: torch.Tensor):
     """
     Compute the total KL divergence between the labels and the distributions the logits.
     :param logits: Tensor of shape (batch_size, num_classes)
@@ -38,7 +38,7 @@ def bernoulli_kl(logits, labels):
     )
 
 
-def beta_llh(params, labels, eps=1e-2):
+def beta_llh(params: torch.Tensor, labels: torch.Tensor, eps: float = 1e-2):
     """
     Compute the log likelihood of the labels given the logits for a binary classification.
     :param params: Tensor of shape (batch_size, 2)
@@ -76,7 +76,7 @@ def beta_llh(params, labels, eps=1e-2):
     )
 
 
-def beta_params_kl(params_p, params_q):
+def beta_params_kl(params_p: torch.Tensor, params_q: torch.Tensor):
     """
     Compute the KL divergence between two beta distributions parameterized by params_p and params_q.
     :param params_p: Tensor of shape (batch_size, 2)
@@ -99,7 +99,7 @@ def beta_params_kl(params_p, params_q):
     return kl_divergence.to(original_dtype)
 
 
-def bernoulli_params_kl(params_p, params_q):
+def bernoulli_params_kl(params_p: torch.Tensor, params_q: torch.Tensor):
     """
     Compute the KL divergence between two bernoulli distributions parameterized by params_p and params_q.
     :param params_p: Tensor of shape (batch_size, 2)
@@ -183,7 +183,7 @@ class ORCA(torch.nn.Module):
                 f"Unknown init_type: {self.init_type}. Choose from ['xavier_normal', 'kaiming_normal']"
             )
 
-    def forward(self, x, prior_params=None):
+    def forward(self, x: dict, prior_params=None):
         input_ids, input_lengths = x["input_ids"], x["input_len"]
         input_embeddings = self.lm.get_input_embeddings()(input_ids)
         if self.cls_token is not None:
@@ -226,7 +226,7 @@ class ORCA(torch.nn.Module):
             "kl_divergence": kl_divergence.sum() if kl_divergence is not None else None,
         }
 
-    def save_to_directory(self, dir_path):
+    def save_to_directory(self, dir_path: str):
         """
         Save the model to a directory.
         :param dir_path: Directory path to save the model.
@@ -249,7 +249,9 @@ class ORCA(torch.nn.Module):
         :param device: Device to load the model on.
         :return: Loaded model instance.
         """
-        os.makedirs(dir_path, exist_ok=True)
+        print(f"Loading ORCA model from {dir_path}")
+        if not os.path.isdir(dir_path):
+            raise FileNotFoundError(f"Checkpoint directory not found: {dir_path}")
         with open(os.path.join(dir_path, "config.yaml"), "r") as f:
             config = yaml.load(f, Loader=yaml.FullLoader)
         model = cls(

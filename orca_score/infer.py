@@ -11,70 +11,13 @@ import yaml
 from peft import PeftModel
 from scipy.stats import kendalltau, spearmanr
 from torch.utils.data import DataLoader
-from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from orca_score import data, model
 
 
-def parse_arguments():
-    """Parse command line arguments."""
-
-    parser = argparse.ArgumentParser(
-        description="ORCA Inference Script",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    parser.add_argument("--batch_size", type=int, default=4, help="Batch size for inference")
-    parser.add_argument(
-        "--num_workers", type=int, default=0, help="Number of workers for DataLoader"
-    )
-
-    parser.add_argument("--tokenizer_path", type=str, help="Path to the tokenizer directory.")
-    parser.add_argument(
-        "--test_set_is_labeled",
-        action="store_true",
-        help="If set, the test set is assumed to be labeled.",
-    )
-    parser.add_argument(
-        "--skip_rationale",
-        action="store_true",
-        help="If set, the model will not use rationales for scoring.",
-    )
-    parser.add_argument(
-        "--skip_question",
-        action="store_true",
-        help="If set, the model will not use questions for scoring.",
-    )
-    parser.add_argument(
-        "--add_transcript",
-        action="store_true",
-        help="If set, the model will use transcript as additional context.",
-    )
-
-    parser.add_argument(
-        "--model_path",
-        type=str,
-        required=True,
-        help="Path to the trained ORCA model directory (best/model/)",
-    )
-    parser.add_argument(
-        "--data",
-        type=str,
-        required=True,
-        help="Path to the json file containing the data to score.",
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default=None,
-        help="Directory to save inference results. Defaults to sub-dir in model directory.",
-    )
-
-    args = parser.parse_args()
-
-    return args
-
-
 def main():
+    """Main function for ORCA inference."""
 
     args = parse_arguments()
 
@@ -92,23 +35,18 @@ def main():
         accelerator.print(f"{arg:<30} {getattr(args, arg)}")
     accelerator.print("-" * 50)
 
-    if args.test_set_is_labeled:
-        inference_data = data.UnifiedAnnotationDataset(
-            args.data,
-            skip_question=args.skip_question,
-            skip_rationale=args.skip_rationale,
-            add_transcript=args.add_transcript,
-        )
-    else:
-        inference_data = data.InferenceDataset(
-            args.data,
-            skip_question=args.skip_question,
-            skip_rationale=args.skip_rationale,
-            add_transcript=args.add_transcript,
-        )
+    # Load JSONL data using UnifiedAnnotationDataset
+    accelerator.print("Loading JSONL data with UnifiedAnnotationDataset")
+    inference_data = data.UnifiedAnnotationDataset(
+        args.data_jsonl,
+        skip_question=args.skip_question,
+        skip_rationale=args.skip_rationale,
+        add_transcript=args.add_transcript,
+    )
 
     # Load the ORCA model
     if os.path.isfile(os.path.join(args.model_path, "lm", "adapter_config.json")):
+        # LoRA case: load base model + adapters
         base_model_name = json.load(
             open(os.path.join(args.model_path, "lm", "adapter_config.json"))
         )["base_model_name_or_path"]
@@ -125,7 +63,8 @@ def main():
         )
         lm = lm.merge_and_unload()  # type: ignore
     else:
-        lm = AutoModel.from_pretrained(
+        # Full fine-tuning case: load complete fine-tuned model
+        lm = AutoModelForCausalLM.from_pretrained(
             os.path.join(args.model_path, "lm"),
             device_map=device.type,
             low_cpu_mem_usage=True,
@@ -134,8 +73,10 @@ def main():
     if args.tokenizer_path:
         tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
     else:
+        # Checkpoint layout: best/model/lm, best/tokenizer
+        # model_path points to best/model, so tokenizer is one level up
         tokenizer = AutoTokenizer.from_pretrained(
-            os.path.join(os.path.dirname(args.model_path), "../tokenizer"),
+            os.path.join(os.path.dirname(args.model_path), "tokenizer"),
         )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -271,6 +212,63 @@ def main():
             score_file = os.path.join(args.output_dir, "scores.yaml")
             with open(score_file, "w") as f:
                 yaml.dump(metrics, f)
+
+
+def parse_arguments():
+    """Parse command line arguments."""
+
+    parser = argparse.ArgumentParser(
+        description="ORCA Inference Script",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--model_path",
+        type=str,
+        required=True,
+        help="Path to the trained ORCA model directory (best/model/)",
+    )
+    parser.add_argument(
+        "--data_jsonl",
+        type=str,
+        required=True,
+        help="Path to the JSONL file containing the data to score.",
+    )
+    parser.add_argument("--batch_size", type=int, default=4, help="Batch size for inference")
+    parser.add_argument(
+        "--num_workers", type=int, default=0, help="Number of workers for DataLoader"
+    )
+
+    parser.add_argument("--tokenizer_path", type=str, help="Path to the tokenizer directory.")
+    parser.add_argument(
+        "--test_set_is_labeled",
+        action="store_true",
+        help="If set, the test set is assumed to be labeled.",
+    )
+    parser.add_argument(
+        "--skip_rationale",
+        action="store_true",
+        help="If set, the model will not use rationales for scoring.",
+    )
+    parser.add_argument(
+        "--skip_question",
+        action="store_true",
+        help="If set, the model will not use questions for scoring.",
+    )
+    parser.add_argument(
+        "--add_transcript",
+        action="store_true",
+        help="If set, the model will use transcript as additional context.",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default=None,
+        help="Directory to save inference results. Defaults to sub-dir: `inference_results` in model directory.",
+    )
+
+    args = parser.parse_args()
+
+    return args
 
 
 if __name__ == "__main__":

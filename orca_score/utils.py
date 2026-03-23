@@ -6,6 +6,9 @@ import os
 
 import torch
 import yaml
+from rich.console import Console
+from scipy.stats import kendalltau, spearmanr
+from sklearn.metrics import mean_absolute_error
 from torch.utils.tensorboard import SummaryWriter
 
 
@@ -24,10 +27,17 @@ class CompositeWriter(SummaryWriter):
     """
 
     def __init__(
-        self, log_dir, jsonl_path, text_log_path=None, resume=False, console_print_fn=None, **kwargs
+        self,
+        log_dir,
+        jsonl_path,
+        text_log_path=None,
+        resume=False,
+        console_print_fn=None,
+        **kwargs,
     ):
         self.jsonl_path = jsonl_path
         self.console_print_fn = console_print_fn or print
+        self.console = Console()
 
         # Setup text log path
         if text_log_path:
@@ -81,16 +91,27 @@ class CompositeWriter(SummaryWriter):
         Args:
             message: Message to log
             level: Log level (INFO, WARNING, ERROR, DEBUG)
-            to_console: If True, also prints to console using console_print_fn
+            to_console: If True, also prints to console using rich Console
         """
         # Always log to file
         if self.logger:
             log_func = getattr(self.logger, level.lower(), self.logger.info)
             log_func(message)
 
-        # Optionally print to console
+        # Optionally print to console via rich
         if to_console:
-            self.console_print_fn(message)
+            # Use console_print_fn as the distributed gate (accelerator.print only
+            # prints on the main process), but drive the actual output through rich.
+            # We call console_print_fn to check if this process should print, then
+            # use self.console for the actual formatted output.
+            # Since accelerator.print internally checks is_main_process, we replicate
+            # that gate by calling it with an empty string first would be wasteful;
+            # instead we just call self.console.print directly — accelerator.print
+            # is only needed for bare print() calls outside of rich. For structured
+            # rich output we use console.print directly on every process, but
+            # CompositeWriter is only created on main process in train.py, so this
+            # is safe.
+            self.console.print(message)
 
     def add_scalar(self, *args, **kwargs):
         """Add scalar to TensorBoard."""
@@ -123,6 +144,34 @@ class CompositeWriter(SummaryWriter):
             for handler in self.logger.handlers:
                 handler.close()
                 self.logger.removeHandler(handler)
+
+
+def compute_metrics(
+    annotations: list, predictions: list, variance_annotations: list, variance_predictions: list
+) -> dict:
+    """Compute correlation and error metrics between annotations and model predictions.
+
+    Args:
+        annotations: Ground-truth mean scores.
+        predictions: Predicted mean scores (prob1).
+        variance_annotations: Ground-truth score variances.
+        variance_predictions: Predicted score variances.
+
+    Returns:
+        Dictionary with keys: mean_mae, mean_tau, mean_rho, variance_tau, variance_rho.
+    """
+    mean_tau = kendalltau(annotations, predictions)
+    mean_rho = spearmanr(annotations, predictions)
+    mean_mae = mean_absolute_error(annotations, predictions)
+    variance_tau = kendalltau(variance_annotations, variance_predictions)
+    variance_rho = spearmanr(variance_annotations, variance_predictions)
+    return {
+        "mean_mae": float(mean_mae),
+        "mean_tau": float(mean_tau.statistic),
+        "mean_rho": float(mean_rho.statistic),
+        "variance_tau": float(variance_tau.statistic),
+        "variance_rho": float(variance_rho.statistic),
+    }
 
 
 def save_checkpoint(
