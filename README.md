@@ -93,17 +93,26 @@ orca-infer \
 
 Output `results/your_data/final_result.jsonl` adds `rating_orca` (correctness score in [0,1]) and `variance_orca` to each input row. If `ratings` are provided, Spearman/Kendall/MAE metrics are printed.
 
-### Using the provided evaluation splits
+### Using the provided evaluation data
+
+Download the stage-3 human-annotated JSONL directly from the dataset repo and score it:
 
 ```bash
 hf download BUT-FIT/orca-audio-qa-annotations \
     --type dataset --local-dir ./data \
-    --include "stage3_human/seed_99/*"
+    --include "s3-mmau-pro-human-judge-ratings.jsonl"
 
 orca-infer \
     --model_path orca-gemma-4b/model \
-    --data_jsonl data/stage3_human/seed_99/test.jsonl \
+    --data_jsonl data/s3-mmau-pro-human-judge-ratings.jsonl \
     --output_dir results/
+```
+
+Or use the standalone script that handles both steps automatically:
+
+```bash
+python download_and_infer.py --model gemma-4b --benchmark mmau-pro
+# also available: --benchmark mmau-mmar, --model llama-3b, --model olmo-1b
 ```
 
 ## Quick Start
