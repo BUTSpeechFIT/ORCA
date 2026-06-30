@@ -6,7 +6,67 @@ import torch
 import yaml
 
 
-def bernoulli_kl(logits, labels):
+def multinomial_llh(params: torch.Tensor, labels: torch.Tensor, eps: float = 1e-2):
+    """
+    Negative log-likelihood under a Categorical(π₁,…,π₅) distribution.
+
+    NOTE: expects raw (unnormalized) integer ratings in [1, 5], i.e. pass
+    normalize_ratings=False to UnifiedAnnotationDataset when using this score
+    type.  Labels equal to -100 are treated as padding and masked out.
+    Internally each rating r is mapped to class index (r-1) ∈ {0,1,2,3,4}.
+
+    The sufficient statistics to maximise the log-likelihood are the observed
+    rating counts n_k = #{annotations with rating k}, which naturally emerge
+    from summing over the padded annotation sequence.
+
+    :param params: Tensor of shape (batch_size, num_classes=5) — raw logits
+    :param labels: Tensor of shape (batch_size, num_annotations) — raw 1-5
+                   integer ratings, padded with -100
+    :returns:
+        negative_log_probs : (batch, n_annotations) — per-annotation NLL
+                             (0 at pad positions)
+        prob1              : (batch,) — expected rating in [0,1] = Σ_k π_k·k/4
+        variance           : (batch,) — distributional variance in [0,1] space
+                             = Σ_k π_k·(k/4 − prob1)²
+    """
+    original_dtype = params.dtype
+    params = params.float()
+    logprobs = torch.nn.functional.log_softmax(params, dim=-1)  # (batch, 5)
+
+    if labels is not None:
+        # Labels are raw 1-5 integers; padding sentinel is -100
+        valid_mask = labels >= 0  # (batch, n_annotations)
+
+        # Shift 1-5 → 0-4; clamp for safety; cast to long for indexing
+        label_indices = (labels - 1).clamp(min=0, max=4).long()  # (batch, n_annotations)
+
+        # Gather log-prob for each annotation.
+        # logprobs is (batch, 5); expand to (batch, n_ann, 5) so we can index
+        # the class dimension per annotation with a single gather call.
+        n_ann = label_indices.shape[1]
+        logprobs_exp = logprobs.unsqueeze(1).expand(-1, n_ann, -1)  # (batch, n_ann, 5)
+        log_probs = logprobs_exp.gather(dim=-1, index=label_indices.unsqueeze(-1)).squeeze(
+            -1
+        )  # (batch, n_ann)
+
+        negative_log_probs = -log_probs.to(original_dtype)
+        # Zero out padded positions
+        negative_log_probs = negative_log_probs * valid_mask.to(original_dtype)
+    else:
+        negative_log_probs = None
+
+    # Expected rating in [0,1]: Σ_k π_k · k/4
+    probs = logprobs.exp().to(original_dtype)  # (batch, 5)
+    k_values = torch.arange(5, device=probs.device, dtype=probs.dtype) / 4.0  # [0,.25,.5,.75,1]
+    prob1 = (probs * k_values).sum(dim=-1)  # (batch,)
+
+    # Distributional variance in [0,1]: Σ_k π_k · (k/4 − prob1)²
+    variance = (probs * (k_values - prob1.unsqueeze(-1)) ** 2).sum(dim=-1)  # (batch,)
+
+    return negative_log_probs, prob1, variance
+
+
+def bernoulli_kl(logits: torch.Tensor, labels: torch.Tensor):
     """
     Compute the total KL divergence between the labels and the distributions the logits.
     :param logits: Tensor of shape (batch_size, num_classes)
@@ -16,13 +76,14 @@ def bernoulli_kl(logits, labels):
     original_dtype = logits.dtype
     logits = logits.float()  # Ensure logits are float for numerical stability
     logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
+
     if labels is not None:
         # Average ratings across judges.
         # Just takes the mean of the ratings while accounting the fact that different questions may have different number of ratings
         labels1 = labels.float()
         labels1_mask = labels1 >= 0
         labels1 = labels1.masked_fill(~labels1_mask, 0)
-        labels1 = labels1.sum(dim=-1, keepdim=True) / labels1_mask.sum(dim=-1, keepdim=True).clamp(
+        labels1 = labels1.sum(dim=-1) / labels1_mask.sum(dim=-1).clamp(
             min=1e-8
         )  # Avoid division by zero
         labels0 = 1 - labels1
@@ -38,7 +99,7 @@ def bernoulli_kl(logits, labels):
     )
 
 
-def beta_llh(params, labels, eps=1e-2):
+def beta_llh(params: torch.Tensor, labels: torch.Tensor, eps: float = 1e-2):
     """
     Compute the log likelihood of the labels given the logits for a binary classification.
     :param params: Tensor of shape (batch_size, 2)
@@ -76,7 +137,7 @@ def beta_llh(params, labels, eps=1e-2):
     )
 
 
-def beta_params_kl(params_p, params_q):
+def beta_params_kl(params_p: torch.Tensor, params_q: torch.Tensor):
     """
     Compute the KL divergence between two beta distributions parameterized by params_p and params_q.
     :param params_p: Tensor of shape (batch_size, 2)
@@ -99,7 +160,7 @@ def beta_params_kl(params_p, params_q):
     return kl_divergence.to(original_dtype)
 
 
-def bernoulli_params_kl(params_p, params_q):
+def bernoulli_params_kl(params_p: torch.Tensor, params_q: torch.Tensor):
     """
     Compute the KL divergence between two bernoulli distributions parameterized by params_p and params_q.
     :param params_p: Tensor of shape (batch_size, 2)
@@ -144,7 +205,10 @@ class ORCA(torch.nn.Module):
             self.cls_token = torch.nn.Parameter(torch.randn(lm_hidden_size))
         else:
             self.cls_token = None
-        self.linear = torch.nn.Linear(lm_hidden_size, 2)
+        # multinomial needs 5 output logits (one per rating level); all other
+        # score types (beta, bernoulli) use 2 output parameters.
+        head_output_size = 5 if score_type == "multinomial" else 2
+        self.linear = torch.nn.Linear(lm_hidden_size, head_output_size)
         self.init_type = init_type
         self._init_linear()
 
@@ -152,6 +216,7 @@ class ORCA(torch.nn.Module):
         self.scoring_function = {
             "bernoulli": bernoulli_kl,
             "beta": beta_llh,
+            "multinomial": multinomial_llh,
         }.get(
             score_type, "beta"
         )  # defaults to Beta if unknown score_type
@@ -183,7 +248,7 @@ class ORCA(torch.nn.Module):
                 f"Unknown init_type: {self.init_type}. Choose from ['xavier_normal', 'kaiming_normal']"
             )
 
-    def forward(self, x, prior_params=None):
+    def forward(self, x: dict, prior_params=None):
         input_ids, input_lengths = x["input_ids"], x["input_len"]
         input_embeddings = self.lm.get_input_embeddings()(input_ids)
         if self.cls_token is not None:
@@ -226,7 +291,7 @@ class ORCA(torch.nn.Module):
             "kl_divergence": kl_divergence.sum() if kl_divergence is not None else None,
         }
 
-    def save_to_directory(self, dir_path):
+    def save_to_directory(self, dir_path: str):
         """
         Save the model to a directory.
         :param dir_path: Directory path to save the model.
@@ -249,7 +314,9 @@ class ORCA(torch.nn.Module):
         :param device: Device to load the model on.
         :return: Loaded model instance.
         """
-        os.makedirs(dir_path, exist_ok=True)
+        print(f"Loading ORCA model from {dir_path}")
+        if not os.path.isdir(dir_path):
+            raise FileNotFoundError(f"Checkpoint directory not found: {dir_path}")
         with open(os.path.join(dir_path, "config.yaml"), "r") as f:
             config = yaml.load(f, Loader=yaml.FullLoader)
         model = cls(
@@ -262,7 +329,7 @@ class ORCA(torch.nn.Module):
         model.load_state_dict(
             torch.load(
                 os.path.join(dir_path, "model_minus_lm.pt"),
-                map_location=device,
+                map_location=device if device is not None else "cpu",
                 weights_only=True,
             ),
             strict=False,
