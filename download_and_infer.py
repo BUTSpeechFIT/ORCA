@@ -271,6 +271,9 @@ def main():
         args.var_threshold if args.var_threshold is not None else MODEL_VAR_THRESHOLDS[args.model]
     )
 
+    # Nest results under a model-specific subdir so different models don't overwrite each other.
+    output_dir = Path(args.output_dir) / args.model
+
     if 1 in stages:
         print(f"=== Step 1: Download model ({args.model}) ===")
         download_model(MODEL_REPOS[args.model], model_dir, hf_hub)
@@ -282,16 +285,16 @@ def main():
     if 3 in stages:
         eval_path = Path(args.data_dir) / filename
         print("\n=== Step 3: Run inference ===")
-        run_inference(model_path, [eval_path], args.output_dir, args.batch_size, args.cpu)
+        run_inference(model_path, [eval_path], output_dir, args.batch_size, args.cpu)
 
     # orca-infer writes results to output_dir/<stem>/final_result.jsonl
-    result_dir = Path(args.output_dir) / Path(filename).stem
+    result_dir = output_dir / Path(filename).stem
 
     if 4 in stages:
         print(f"\n=== Step 4: Apply clamping (var_threshold={var_threshold}) ===")
         run_clamping(result_dir, var_threshold)
 
-    print(f"\nDone. Results are in: {args.output_dir}/")
+    print(f"\nDone. Results are in: {output_dir}/")
 
 
 if __name__ == "__main__":
