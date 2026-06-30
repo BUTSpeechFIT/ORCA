@@ -1,19 +1,25 @@
-"""Author: Bolaji Yusuf"""
+"""Author: Bolaji Yusuf, Santosh Kesiraju"""
 
 import argparse
 import json
 import os
 
-import accelerate
 import torch
 import tqdm
 import yaml
 from peft import PeftModel
-from scipy.stats import kendalltau, spearmanr
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from orca_score import data, model
+from orca_score import data, model, utils
+
+
+def _is_labeled(jsonl_path: str) -> bool:
+    """Return True if the first row of the JSONL has at least one valid rating."""
+    with open(jsonl_path, encoding="utf-8") as f:
+        first_line = f.readline()
+    row = json.loads(first_line)
+    return any(r is not None and 0 <= r <= 5 for r in row.get("ratings", []))
 
 
 def main():
@@ -21,38 +27,60 @@ def main():
 
     args = parse_arguments()
 
-    accelerator = accelerate.Accelerator()
-    device = accelerator.device
-    torch.tensor(0).to(accelerator.device)
-
     if not args.output_dir:
         args.output_dir = os.path.join(os.path.dirname(args.model_path), "inference_results")
     os.makedirs(args.output_dir, exist_ok=True)
 
-    accelerator.print(f"{'Argument':<30} {'Value'}")
-    accelerator.print("-" * 50)
-    for arg in vars(args):
-        accelerator.print(f"{arg:<30} {getattr(args, arg)}")
-    accelerator.print("-" * 50)
+    score_file = os.path.join(args.output_dir, "scores.yaml")
 
-    # Load JSONL data using UnifiedAnnotationDataset
-    accelerator.print("Loading JSONL data with UnifiedAnnotationDataset")
-    inference_data = data.UnifiedAnnotationDataset(
-        args.data_jsonl,
-        skip_question=args.skip_question,
-        skip_rationale=args.skip_rationale,
-        add_transcript=args.add_transcript,
+    is_labeled = False
+    # Load existing per-split scores so incremental runs skip already-done splits.
+    all_scores = {}
+    if os.path.exists(score_file):
+        if args.ovr:
+            print(f"Overwriting existing scores file at {score_file}.")
+        else:
+            with open(score_file) as f:
+                all_scores = yaml.safe_load(f) or {}
+
+    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
+    print(
+        "Device:",
+        device,
+        os.environ.get("CUDA_VISIBLE_DEVICES", "All") if device.type == "cuda" else "CPU",
     )
 
-    # Load the ORCA model
+    print(f"{'Argument':<30} {'Value'}")
+    print("-" * 50)
+    for arg in vars(args):
+        print(f"{arg:<30} {getattr(args, arg)}")
+    print("-" * 50)
+
+    # Determine which splits still need running.
+    pending = []
+    for data_jsonl in args.data_jsonl:
+        stem = os.path.splitext(os.path.basename(data_jsonl))[0]
+        split_dir = os.path.join(args.output_dir, stem)
+        already_done = os.path.exists(os.path.join(split_dir, "final_result.jsonl"))
+        if already_done and not args.ovr:
+            print(f"Skipping {stem} (output already exists). Pass --ovr to rerun.")
+        else:
+            pending.append(data_jsonl)
+
+    if not pending:
+        print("All splits already scored. Pass --ovr to rerun.")
+        return
+
+    # Load the ORCA model once — reused for every split.
     if os.path.isfile(os.path.join(args.model_path, "lm", "adapter_config.json")):
         # LoRA case: load base model + adapters
         base_model_name = json.load(
             open(os.path.join(args.model_path, "lm", "adapter_config.json"))
         )["base_model_name_or_path"]
+        model_dtype = torch.float32 if device.type == "cpu" else torch.bfloat16
         lm = AutoModelForCausalLM.from_pretrained(
             base_model_name,
-            dtype=torch.bfloat16,
+            dtype=model_dtype,
             device_map=device.type,
             low_cpu_mem_usage=True,
         )
@@ -64,11 +92,12 @@ def main():
         lm = lm.merge_and_unload()  # type: ignore
     else:
         # Full fine-tuning case: load complete fine-tuned model
+        model_dtype = torch.float32 if device.type == "cpu" else torch.bfloat16
         lm = AutoModelForCausalLM.from_pretrained(
             os.path.join(args.model_path, "lm"),
             device_map=device.type,
             low_cpu_mem_usage=True,
-            dtype=torch.bfloat16,
+            dtype=model_dtype,
         )
     if args.tokenizer_path:
         tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
@@ -82,136 +111,126 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
 
     scoring_model = model.ORCA.load_from_directory(args.model_path, lm=lm, device=device)
-
     collate_fn = data.CollateFn(tokenizer)
-    inference_loader = DataLoader(
-        inference_data,
-        batch_size=args.batch_size,
-        collate_fn=collate_fn,
-        shuffle=False,
-        num_workers=args.num_workers,
-    )
+    # multinomial_llh expects raw integer ratings [1,5]; all other score types
+    # use [0,1]-normalised floats.
+    normalize_ratings = scoring_model.score_type != "multinomial"
 
-    scoring_model.eval()
-    scoring_model, inference_loader = accelerator.prepare(scoring_model, inference_loader)
-    with torch.inference_mode():
-        all_idxs = []
+    for data_jsonl in pending:
+        stem = os.path.splitext(os.path.basename(data_jsonl))[0]
+        split_dir = os.path.join(args.output_dir, stem)
+        os.makedirs(split_dir, exist_ok=True)
+        if not args.do_not_evaluate:
+            is_labeled = _is_labeled(data_jsonl)
+
+        inference_data = data.UnifiedAnnotationDataset(
+            data_jsonl,
+            skip_question=args.skip_question,
+            skip_rationale=args.skip_rationale,
+            add_transcript=args.add_transcript,
+            normalize_ratings=normalize_ratings,
+        )
+        inference_loader = DataLoader(
+            inference_data,
+            batch_size=args.batch_size,
+            collate_fn=collate_fn,
+            shuffle=False,
+            num_workers=0,
+        )
+
+        scoring_model.eval()
+        all_metadata = []
         all_params = []
         all_prob1 = []
         all_variance = []
         all_ratings = []
         all_ground_truth_variances = []
-        for batch in tqdm.tqdm(inference_loader, desc="Inference"):
-            with torch.autocast(device.type, dtype=torch.bfloat16):
-                outputs = scoring_model(batch)
-            params = outputs["params"].cpu().tolist()
-            prob1 = outputs["prob1"].cpu().tolist()
-            variance = outputs["variance"].cpu().tolist()
+        all_n_ratings = []
+        with torch.inference_mode():
+            for batch in tqdm.tqdm(inference_loader, desc=f"Inference [{stem}]"):
+                batch = batch.to(device)
+                if device.type == "cpu":
+                    outputs = scoring_model(batch)
+                else:
+                    with torch.autocast(device.type, dtype=torch.bfloat16):
+                        outputs = scoring_model(batch)
+                all_metadata.extend(batch["metadata"])
+                all_params.extend(outputs["params"].cpu().tolist())
+                all_prob1.extend(outputs["prob1"].cpu().tolist())
+                all_variance.extend(outputs["variance"].cpu().tolist())
+                all_n_ratings.extend(batch["n_ratings"].cpu().tolist())
+                if is_labeled:
+                    all_ratings.extend(batch["average_labels"].cpu().tolist())
+                    all_ground_truth_variances.extend(batch["label_variance"].cpu().tolist())
 
-            all_idxs.extend(batch["idx"])
-            all_params.extend(params)
-            all_prob1.extend(prob1)
-            all_variance.extend(variance)
-            if args.test_set_is_labeled:
-                all_ratings.extend(batch["average_labels"].cpu().tolist())
-                all_ground_truth_variances.extend(batch["label_variance"].cpu().tolist())
+        # One row per input — original fields plus ORCA predictions
+        with open(os.path.join(split_dir, "final_result.jsonl"), "w") as f:
+            for i, (meta, param, prob1, variance) in enumerate(
+                zip(all_metadata, all_params, all_prob1, all_variance)
+            ):
+                entry = {
+                    **meta,
+                    "rating_orca": prob1,
+                    "variance_orca": variance,
+                    "params": param,
+                    "n_ratings": all_n_ratings[i],
+                }
+                if is_labeled:
+                    entry["rating_ground_truth"] = all_ratings[i]
+                    entry["variance_ground_truth"] = all_ground_truth_variances[i]
+                f.write(json.dumps(entry) + "\n")
 
-        # Save results
-        result = {
-            "params": all_params,
-            "rating_orca": all_prob1,
-            "idx": all_idxs,
-            "variance_orca": all_variance,
-        }
-        if args.test_set_is_labeled:
-            result["rating_ground_truth"] = all_ratings
-            result["variance_ground_truth"] = all_ground_truth_variances
-        output_file = os.path.join(args.output_dir, f"result_{accelerator.process_index}.yaml")
-        with open(output_file, "w") as f:
-            yaml.dump(result, f)
+        if is_labeled:
+            # For multinomial, ground-truth average_labels and label_variance are in
+            # [1,5] / [0,16] space (normalize_ratings=False); scale them down to [0,1]
+            # so MAE is comparable with beta/bernoulli. Predictions (prob1, variance)
+            # are already in [0,1] space.
+            gt_ratings = all_ratings
+            gt_variances = all_ground_truth_variances
+            if scoring_model.score_type == "multinomial":
+                gt_ratings = [(r - 1) / 4 for r in all_ratings]
+                gt_variances = [v / 16 for v in all_ground_truth_variances]
 
-    if accelerator.is_main_process:
-        all_idxs = []
-        all_params = []
-        all_prob1 = []
-        all_variance = []
-        all_ratings = []
-        all_ground_truth_variances = []
-        for i in range(accelerator.num_processes):
-            output_file = os.path.join(args.output_dir, f"result_{i}.yaml")
-            with open(output_file, "r") as f:
-                result = yaml.load(f, Loader=yaml.FullLoader)
-            all_idxs.extend(result["idx"])
-            all_params.extend(result["params"])
-            all_prob1.extend(result["rating_orca"])
-            all_variance.extend(result["variance_orca"])
-            if args.test_set_is_labeled:
-                all_ratings.extend(result["rating_ground_truth"])
-                all_ground_truth_variances.extend(result["variance_ground_truth"])
+            # Variance metrics use only samples with >= 3 annotations (unbiased
+            # estimate requires n >= 2; >= 3 provides a more reliable variance estimate).
+            var_mask = [n >= 3 for n in all_n_ratings]
+            n_var = sum(var_mask)
+            gt_var_sub = [v for v, ok in zip(gt_variances, var_mask) if ok]
+            pred_var_sub = [v for v, ok in zip(all_variance, var_mask) if ok]
 
-        final_result = {
-            "params": all_params,
-            "rating_orca": all_prob1,
-            "idx": all_idxs,
-            "variance_orca": all_variance,
-        }
-        if args.test_set_is_labeled:
-            final_result["rating_ground_truth"] = all_ratings
-            final_result["variance_ground_truth"] = all_ground_truth_variances
-        final_result_indexed_by_idx = {}
-        for idx, param, prob1, variance in zip(all_idxs, all_params, all_prob1, all_variance):
-            final_result_indexed_by_idx[idx] = {
-                "param": param,
-                "rating_orca": prob1,
-                "variance_orca": variance,
-            }
-            if args.test_set_is_labeled:
-                final_result_indexed_by_idx[idx]["rating_ground_truth"] = all_ratings[
-                    all_idxs.index(idx)
-                ]
-                final_result_indexed_by_idx[idx]["variance_ground_truth"] = (
-                    all_ground_truth_variances[all_idxs.index(idx)]
-                )
-        final_output_file = os.path.join(args.output_dir, "final_result_by_idx.yaml")
-        with open(final_output_file, "w") as f:
-            yaml.dump(final_result_indexed_by_idx, f)
-        final_output_file = os.path.join(args.output_dir, "final_result_as_list.yaml")
-        with open(final_output_file, "w") as f:
-            yaml.dump(final_result, f)
-
-        if args.test_set_is_labeled:
-            # Compute Kendall Tau and Spearman correlation
-            tau = kendalltau(all_ratings, all_prob1)
-            spearman_corr = spearmanr(all_ratings, all_prob1)
-            tau_val = float(tau.statistic)
-            spearman_val = float(spearman_corr.statistic)
+            m = utils.compute_metrics(gt_ratings, all_prob1, gt_var_sub, pred_var_sub)
 
             metrics = {
-                "rating_kendall_tau": round(tau_val, 6),
-                "rating_spearman_correlation": round(spearman_val, 6),
+                "n": len(all_ratings),
+                "mean_mae": round(m["mean_mae"], 6),
+                "rating_kendall_tau": round(m["mean_tau"], 6),
+                "rating_spearman_correlation": round(m["mean_rho"], 6),
             }
 
             print("\n" + "=" * 40)
             print(f"{'Metric':<25} {'Value':>10}")
             print("-" * 40)
-            print(f"{'Kendall τ (tau)':<25} {tau_val:>10.6f}")
-            print(f"{'Spearman ρ (rho)':<25} {spearman_val:>10.6f}")
+            print(f"{'MAE':<25} {m['mean_mae']:>10.6f}")
+            print(f"{'Kendall τ (tau)':<25} {m['mean_tau']:>10.6f}")
+            print(f"{'Spearman ρ (rho)':<25} {m['mean_rho']:>10.6f}")
 
-            if scoring_model.score_type == "beta":
-                variance_tau = kendalltau(all_ground_truth_variances, all_variance)
-                variance_spearman_corr = spearmanr(all_ground_truth_variances, all_variance)
-                variance_tau_val = float(variance_tau.statistic)
-                variance_spearman_val = float(variance_spearman_corr.statistic)
-                print(f"{'Variance Kendall τ':<25} {variance_tau_val:>10.6f}")
-                print(f"{'Variance Spearman ρ':<25} {variance_spearman_val:>10.6f}")
-                metrics["variance_kendall_tau"] = round(variance_tau_val, 6)
-                metrics["variance_spearman_correlation"] = round(variance_spearman_val, 6)
+            if scoring_model.score_type in ("beta", "multinomial"):
+                print(f"{'Variance MAE':<25} {m['variance_mae']:>10.6f}  (n_var={n_var})")
+                print(f"{'Variance Kendall τ':<25} {m['variance_tau']:>10.6f}")
+                print(f"{'Variance Spearman ρ':<25} {m['variance_rho']:>10.6f}")
+                metrics["n_var"] = n_var
+                metrics["variance_mae"] = round(m["variance_mae"], 6)
+                metrics["variance_kendall_tau"] = round(m["variance_tau"], 6)
+                metrics["variance_spearman_correlation"] = round(m["variance_rho"], 6)
 
             print("=" * 40 + "\n")
 
-            score_file = os.path.join(args.output_dir, "scores.yaml")
-            with open(score_file, "w") as f:
-                yaml.dump(metrics, f)
+            all_scores[stem] = metrics
+
+    if all_scores:
+        with open(score_file, "w") as f:
+            yaml.dump(all_scores, f)
+        print(f"Scores written to {score_file}")
 
 
 def parse_arguments():
@@ -225,25 +244,21 @@ def parse_arguments():
         "--model_path",
         type=str,
         required=True,
-        help="Path to the trained ORCA model directory (best/model/)",
+        help="Path to the trained ORCA model directory (best/model)",
     )
     parser.add_argument(
         "--data_jsonl",
         type=str,
+        nargs="+",
         required=True,
-        help="Path to the JSONL file containing the data to score.",
+        help="One or more JSONL files to score. Results for each are saved in output_dir/<stem>/.",
     )
-    parser.add_argument("--batch_size", type=int, default=4, help="Batch size for inference")
+    parser.add_argument("--batch_size", type=int, default=2, help="Batch size for inference")
     parser.add_argument(
         "--num_workers", type=int, default=0, help="Number of workers for DataLoader"
     )
 
     parser.add_argument("--tokenizer_path", type=str, help="Path to the tokenizer directory.")
-    parser.add_argument(
-        "--test_set_is_labeled",
-        action="store_true",
-        help="If set, the test set is assumed to be labeled.",
-    )
     parser.add_argument(
         "--skip_rationale",
         action="store_true",
@@ -264,6 +279,21 @@ def parse_arguments():
         type=str,
         default=None,
         help="Directory to save inference results. Defaults to sub-dir: `inference_results` in model directory.",
+    )
+    parser.add_argument(
+        "--cpu",
+        action="store_true",
+        help="Run inference on CPU (uses float32 instead of bfloat16).",
+    )
+    parser.add_argument(
+        "--ovr",
+        action="store_true",
+        help="Overwrite existing scores file if it exists. Use with caution to avoid losing previous results.",
+    )
+    parser.add_argument(
+        "--do_not_evaluate",
+        action="store_true",
+        help="do not compute evaluation metrics irrespective of whether the test set is labelled or not",
     )
 
     args = parser.parse_args()

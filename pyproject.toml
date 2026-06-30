@@ -15,12 +15,21 @@ dependencies = [
     "peft",
     "scipy",
     "pyyaml",
-    "tqdm",
+    "rich",
     "tensorboard",
     "bitsandbytes",
+    "vllm",
+    "scikit-learn",
 ]
 
 [project.optional-dependencies]
+webapp = [
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.29.0",
+    "python-multipart",
+]
+
+[dependency-groups]
 dev = [
     "pytest",
     "black",
@@ -31,6 +40,8 @@ dev = [
     "huggingface_hub[cli]",
     "pre-commit",
     "matplotlib",
+    "ipykernel",
+    "requests",
 ]
 
 [project.scripts]
@@ -43,6 +54,3 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["orca_score"]
-
-[tool.uv]
-dev-dependencies = []

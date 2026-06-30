@@ -15,14 +15,18 @@ from torch.utils.tensorboard import SummaryWriter
 class CompositeWriter(SummaryWriter):
     """Writer that logs to TensorBoard, JSONL, and text logs.
 
-    This class inherits from SummaryWriter and adds JSONL logging and text logging capabilities.
+    On non-main processes all methods are no-ops, so it is safe to construct
+    unconditionally and call without ``if accelerator.is_main_process`` guards.
+    File I/O (log rotation, handler creation, TensorBoard init) only runs on
+    the main process, eliminating multi-GPU race conditions.
 
     Args:
-        log_dir: Directory for TensorBoard logs (required).
-        jsonl_path: Path to JSONL file for metrics logging (required).
-        text_log_path: Path to text log file. If None, will be auto-generated from jsonl_path.
+        log_dir: Directory for TensorBoard logs.
+        jsonl_path: Path to JSONL file for metrics logging.
+        is_main_process: Only this process does real I/O. Defaults to True.
+        text_log_path: Path to text log file. If None, auto-generated alongside jsonl_path.
         resume: If True, appends to existing log. If False, rotates old log file.
-        console_print_fn: Callable for console output. Defaults to print(). Pass accelerator.print for distributed training.
+        console_print_fn: Callable for console output. Defaults to print().
         **kwargs: Additional arguments passed to SummaryWriter.
     """
 
@@ -30,45 +34,55 @@ class CompositeWriter(SummaryWriter):
         self,
         log_dir,
         jsonl_path,
+        is_main_process=True,
         text_log_path=None,
         resume=False,
         console_print_fn=None,
         **kwargs,
     ):
+        self._enabled = is_main_process
+        self.console = Console()
+
+        if not self._enabled:
+            # Non-main process: store paths for reference but open no files.
+            self.jsonl_path = jsonl_path
+            log_dir_path = os.path.dirname(jsonl_path)
+            self.text_log_path = text_log_path or os.path.join(log_dir_path, "training.log")
+            self.logger = None
+            # Initialise SummaryWriter to a temp dir so the object is valid,
+            # but immediately close it so no files are created.
+            import tempfile
+
+            super().__init__(log_dir=tempfile.mkdtemp(), **kwargs)
+            self.close()
+            return
+
         self.jsonl_path = jsonl_path
         self.console_print_fn = console_print_fn or print
-        self.console = Console()
 
         # Setup text log path
         if text_log_path:
             self.text_log_path = text_log_path
         else:
-            # Auto-generate text log path from jsonl_path
             log_dir_path = os.path.dirname(jsonl_path)
             self.text_log_path = os.path.join(log_dir_path, "training.log")
 
-        # Ensure directory exists
         os.makedirs(os.path.dirname(self.text_log_path), exist_ok=True)
 
-        # Handle log rotation: rotate if file exists and NOT resuming
-        # When resuming, we append to existing log. When restarting, we rotate old log.
+        # Rotate existing log file when starting fresh (not resuming).
         if os.path.exists(self.text_log_path) and not resume:
             self._rotate_log_file()
 
         # Setup text logger
         self.logger = logging.getLogger(f"orca_training_{id(self)}")
         self.logger.setLevel(logging.INFO)
-        self.logger.handlers.clear()  # Clear any existing handlers
-
-        # Use append mode if resuming, write mode if restarting
+        self.logger.handlers.clear()
         mode = "a" if resume else "w"
         handler = logging.FileHandler(self.text_log_path, mode=mode)
-        formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-        handler.setFormatter(formatter)
+        handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
         self.logger.addHandler(handler)
-        self.logger.propagate = False  # Prevent duplicate logs
+        self.logger.propagate = False
 
-        # Initialize TensorBoard
         os.makedirs(log_dir, exist_ok=True)
         super().__init__(log_dir=log_dir, **kwargs)
 
@@ -86,55 +100,34 @@ class CompositeWriter(SummaryWriter):
         os.rename(self.text_log_path, f"{base_path}.{num}.{ext}")
 
     def log(self, message, level="INFO", to_console=False):
-        """Log text message to file and optionally to console.
-
-        Args:
-            message: Message to log
-            level: Log level (INFO, WARNING, ERROR, DEBUG)
-            to_console: If True, also prints to console using rich Console
-        """
-        # Always log to file
+        """Log text message to file and optionally to console. No-op on non-main processes."""
+        if not self._enabled:
+            return
         if self.logger:
             log_func = getattr(self.logger, level.lower(), self.logger.info)
             log_func(message)
-
-        # Optionally print to console via rich
         if to_console:
-            # Use console_print_fn as the distributed gate (accelerator.print only
-            # prints on the main process), but drive the actual output through rich.
-            # We call console_print_fn to check if this process should print, then
-            # use self.console for the actual formatted output.
-            # Since accelerator.print internally checks is_main_process, we replicate
-            # that gate by calling it with an empty string first would be wasteful;
-            # instead we just call self.console.print directly — accelerator.print
-            # is only needed for bare print() calls outside of rich. For structured
-            # rich output we use console.print directly on every process, but
-            # CompositeWriter is only created on main process in train.py, so this
-            # is safe.
             self.console.print(message)
 
     def add_scalar(self, *args, **kwargs):
-        """Add scalar to TensorBoard."""
+        """Add scalar to TensorBoard. No-op on non-main processes."""
+        if not self._enabled:
+            return
         super().add_scalar(*args, **kwargs)
 
     def add_hparams(self, hparam_dict, metric_dict, **kwargs):
-        """Log hyperparameters and metrics to both TensorBoard and JSONL.
-
-        Args:
-            hparam_dict: Dictionary of hyperparameters.
-            metric_dict: Dictionary of metrics.
-            **kwargs: Additional arguments passed to TensorBoard's add_hparams.
-        """
-        # Set run_name to empty string to prevent creating subdirectories
+        """Log hyperparameters and metrics to TensorBoard and JSONL. No-op on non-main processes."""
+        if not self._enabled:
+            return
         kwargs.setdefault("run_name", ".")
         super().add_hparams(hparam_dict, metric_dict, **kwargs)
-
-        # Always log to JSONL
         with open(self.jsonl_path, "a") as f:
             f.write(json.dumps({**hparam_dict, **metric_dict}) + "\n")
 
     def flush(self):
-        """Flush TensorBoard writer."""
+        """Flush TensorBoard writer. No-op on non-main processes."""
+        if not self._enabled:
+            return
         super().flush()
 
     def close(self):
@@ -158,17 +151,19 @@ def compute_metrics(
         variance_predictions: Predicted score variances.
 
     Returns:
-        Dictionary with keys: mean_mae, mean_tau, mean_rho, variance_tau, variance_rho.
+        Dictionary with keys: mean_mae, mean_tau, mean_rho, variance_mae, variance_tau, variance_rho.
     """
     mean_tau = kendalltau(annotations, predictions)
     mean_rho = spearmanr(annotations, predictions)
     mean_mae = mean_absolute_error(annotations, predictions)
+    variance_mae = mean_absolute_error(variance_annotations, variance_predictions)
     variance_tau = kendalltau(variance_annotations, variance_predictions)
     variance_rho = spearmanr(variance_annotations, variance_predictions)
     return {
         "mean_mae": float(mean_mae),
         "mean_tau": float(mean_tau.statistic),
         "mean_rho": float(mean_rho.statistic),
+        "variance_mae": float(variance_mae),
         "variance_tau": float(variance_tau.statistic),
         "variance_rho": float(variance_rho.statistic),
     }
@@ -183,18 +178,47 @@ def save_checkpoint(
     args=None,
     tokenizer=None,
 ):
+    """Save model and optimizer state to a checkpoint directory.
+
+    FSDP-compatible: all ranks must call this function concurrently.
+    ``accelerator.get_state_dict()`` is a collective all-gather that requires
+    every rank to participate; only rank 0 then writes files to disk.
+    Single-GPU (accelerator=None) falls back to the original behaviour.
     """
-    Save the model and optimizer state to a checkpoint directory.
-    """
-    os.makedirs(output_dir, exist_ok=True)
-    if tokenizer is not None:
-        tokenizer.save_pretrained(os.path.join(output_dir, "tokenizer"))
+    model_dir = os.path.join(output_dir, "model")
+
     if accelerator is None:
-        scoring_model.save_to_directory(os.path.join(output_dir, "model"))
+        # Single-GPU path — unchanged behaviour
+        os.makedirs(output_dir, exist_ok=True)
+        if tokenizer is not None:
+            tokenizer.save_pretrained(os.path.join(output_dir, "tokenizer"))
+        scoring_model.save_to_directory(model_dir)
+        if optimizer is not None:
+            torch.save(optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
     else:
-        accelerator.unwrap_model(scoring_model).save_to_directory(os.path.join(output_dir, "model"))
-    if optimizer is not None:
-        torch.save(optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
+        # FSDP path — gather full state dict across all ranks (collective)
+        full_state_dict = accelerator.get_state_dict(scoring_model)
+        # Only rank 0 writes files; other ranks have already contributed to the
+        # all-gather and can return now.
+        if not accelerator.is_main_process:
+            return
+        os.makedirs(output_dir, exist_ok=True)
+        if tokenizer is not None:
+            tokenizer.save_pretrained(os.path.join(output_dir, "tokenizer"))
+        # Split into LM weights (saved via save_pretrained) and the linear head
+        lm_state_dict = {
+            k[len("lm.") :]: v for k, v in full_state_dict.items() if k.startswith("lm.")
+        }
+        non_lm_state_dict = {k: v for k, v in full_state_dict.items() if not k.startswith("lm.")}
+        unwrapped = accelerator.unwrap_model(scoring_model)
+        os.makedirs(os.path.join(model_dir, "lm"), exist_ok=True)
+        with open(os.path.join(model_dir, "config.yaml"), "w") as f:
+            yaml.dump(unwrapped.config, f)
+        unwrapped.lm.save_pretrained(os.path.join(model_dir, "lm"), state_dict=lm_state_dict)
+        torch.save(non_lm_state_dict, os.path.join(model_dir, "model_minus_lm.pt"))
+        # Optimizer state is rank-local with FSDP; resume from FSDP runs is not
+        # supported — skip to avoid saving a partial (rank-0-only) state dict.
+
     if args is not None:
         with open(os.path.join(output_dir, "args.yaml"), "w") as f:
             yaml.dump(vars(args), f)

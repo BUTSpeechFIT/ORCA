@@ -4,7 +4,7 @@ import json
 import random
 
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 
 
 class DataItem(dict):
@@ -33,24 +33,32 @@ class UnifiedAnnotationDataset(Dataset):
         skip_question=False,
         add_transcript=False,
         log_fn=None,
+        normalize_ratings=True,
     ):
         """
-        A dataset that loads annotations from a JSON file and formats them for training.
-        :param annotations_file: Path to the JSON file containing annotations.
-        :param prompts: List of prompts to randomply sample a prompt to be prepended to the data. If None, a default empty prompt is used.
-        :param filter_func: A function that takes an item and returns True if the item should be included in the dataset, False otherwise.
-        :param log_fn: Optional logging function. If provided, will log filtering statistics.
+        A dataset that loads annotations from a JSONL file and formats them for training.
+
+        Args:
+            annotations_file: Path to the JSONL file containing annotations.
+            prompts: List of prompts to randomly sample a prompt to be prepended to the data. If None, a default empty prompt is used.
+            filter_func: A function that takes an item and returns True if the item should be included in the dataset, False otherwise.
+            log_fn: Optional logging function. If provided, will log filtering statistics.
+            normalize_ratings: If True, will normalize ratings originally in the range [1, 5] to the range [0, 1] by subtracting 1 and dividing by 4. If False, will keep original rating values.
+                NOTE: pass normalize_ratings=False when using score_type='multinomial' so that
+                raw integer ratings [1,5] are preserved; multinomial_llh in model.py expects
+                unnormalized labels and handles the 1-5 → 0-4 index shift internally.
         """
-        self.annotations = json.load(open(annotations_file, "r", encoding="utf-8"))
-        self.annotation_keys = list(self.annotations.keys())
-        self.annotation_keys = [
-            key
-            for key in self.annotation_keys
-            if any([r is not None for r in self.annotations[key]["ratings"]])
-        ]
-        self.keys_to_id = {key: i for i, key in enumerate(self.annotation_keys)}
-        self.annotation_ids = ["_".join(key.split("_")[:-2]) for key in self.annotation_keys]
-        self.model_ids = ["_".join(key.split("_")[-2:]) for key in self.annotation_keys]
+
+        self.annotations = []
+        self.annotation_keys = []
+        with open(annotations_file, "r", encoding="utf-8") as fpr:
+            for line in fpr:
+                data_dict = json.loads(line)
+                ratings = [r for r in data_dict["ratings"] if r is not None and 0 <= r <= 5]
+                if len(ratings) > 0:
+                    self.annotations.append(data_dict)
+                    self.annotation_keys.append(data_dict["id"])
+
         self.prompts = prompts if prompts is not None else [""]
         self.context_prefix = "|context: "
         self.question_prefix = "|question: "
@@ -62,14 +70,21 @@ class UnifiedAnnotationDataset(Dataset):
         self.add_transcript = add_transcript
         self.log_fn = log_fn or print
 
+        self.normalize_ratings = normalize_ratings
+
+        if self.normalize_ratings:
+            self.log_fn(
+                "Normalizing ratings from [1, 5] to [0, 1] by subtracting 1 and dividing by 4."
+            )
+
         if filter_func is not None:
-            self.log_fn(f"Length before filtering: {len(self.annotation_keys)}")
+            self.log_fn(f"Length before filtering: {len(self.annotations)}")
             self.annotation_keys = [
-                key for key in self.annotation_keys if filter_func(self[self.keys_to_id[key]])
+                key for idx, key in enumerate(self.annotation_keys) if filter_func(self[idx])
             ]
-            self.keys_to_id = {key: i for i, key in enumerate(self.annotation_keys)}
-            self.annotation_ids = ["_".join(key.split("_")[:-2]) for key in self.annotation_keys]
-            self.model_ids = ["_".join(key.split("_")[-2:]) for key in self.annotation_keys]
+            # self.keys_to_id = {key: i for i, key in enumerate(self.annotation_keys)}
+            # self.annotation_ids = ["_".join(key.split("_")[:-2]) for key in self.annotation_keys]
+            # self.model_ids = ["_".join(key.split("_")[-2:]) for key in self.annotation_keys]
             self.log_fn(f"Length after filtering: {len(self.annotation_keys)}")
 
     def __len__(self):
@@ -79,7 +94,7 @@ class UnifiedAnnotationDataset(Dataset):
         return self.annotation_keys
 
     def __getitem__(self, idx):
-        item = self.annotations[self.annotation_keys[idx]]
+        item = self.annotations[idx]
         prompt = random.choice(self.prompts)
         context = item["rationale"]
         question = item["question"]
@@ -88,11 +103,23 @@ class UnifiedAnnotationDataset(Dataset):
         if self.add_transcript and "transcription" in item:
             context = f"{self.transcript_prefix}{item['transcription']} {context}"
         ratings = item["ratings"]
-        ratings = [
-            float(rating - 1) / 4 for rating in ratings if rating is not None and 0 <= rating <= 5
-        ]
-        average_rating = sum(ratings) / len(ratings)
-        rating_variance = sum((x - average_rating) ** 2 for x in ratings) / len(ratings)
+        if self.normalize_ratings:
+            ratings = [
+                float(rating - 1) / 4
+                for rating in ratings
+                if rating is not None and 0 <= rating <= 5
+            ]
+        else:
+            ratings = [
+                float(rating) for rating in ratings if rating is not None and 0 <= rating <= 5
+            ]
+        n_r = len(ratings)
+        average_rating = sum(ratings) / n_r
+
+        # unbiased estimator (Bessel's correction); 0.0 for singletons
+        rating_variance = (
+            sum((x - average_rating) ** 2 for x in ratings) / (n_r - 1) if n_r > 1 else 0.0
+        )
         # format_free = (
         #     f'{prompt} '
         #     f'{self.context_prefix}{context} '
@@ -108,146 +135,76 @@ class UnifiedAnnotationDataset(Dataset):
         format_free += f" {self.answer_prefix}{answer}"
         format_free += f" {self.candidate_prefix}{candidate_answer}"
 
-        model_id = self.model_ids[idx]
         return {
             "text": format_free,
             "soft_labels": ratings,
             "average_rating": average_rating,
             "rating_variance": rating_variance,
+            "n_ratings": n_r,
             "metadata": item,
             "prompt": prompt,
-            "idx": self.annotation_keys[idx],
-            "annotation_id": self.annotation_ids[idx],
-            "model_id": model_id,
+            "id": self.annotation_keys[idx],
         }
 
     def __iter__(self):
         for i in range(len(self.annotation_keys)):
             yield self[i]
 
-
-class InferenceDataset(UnifiedAnnotationDataset):
-    def __getitem__(self, idx):
-        item = self.annotations[self.annotation_keys[idx]]
-        prompt = random.choice(self.prompts)
-        context = item["rationale"]
-        question = item["question"]
-        answer = item["reference"]
-        candidate_answer = item["candidate"]
-        ratings = [0.0, 1.0]
-        average_rating = sum(ratings) / len(ratings)
-        rating_variance = sum((x - average_rating) ** 2 for x in ratings) / len(ratings)
-        format_free = (
-            f"{prompt} "
-            f"{self.context_prefix}{context} "
-            f"{self.question_prefix}{question} "
-            f"{self.answer_prefix}{answer} "
-            f"{self.candidate_prefix}{candidate_answer}"
-        )
-        model_id = self.model_ids[idx]
-        return {
-            "text": format_free,
-            "soft_labels": ratings,
-            "average_rating": average_rating,
-            "rating_variance": rating_variance,
-            "metadata": item,
-            "prompt": prompt,
-            "idx": self.annotation_keys[idx],
-            "annotation_id": self.annotation_ids[idx],
-            "model_id": model_id,
-        }
+    @property
+    def seq_lengths(self):
+        """Character lengths of each formatted text item (proxy for token length)."""
+        prompt = self.prompts[0]
+        lengths = []
+        for i in range(len(self)):
+            item = self.annotations[i]
+            context = item["rationale"]
+            if self.add_transcript and "transcription" in item:
+                context = f"{self.transcript_prefix}{item['transcription']} {context}"
+            text = prompt
+            if not self.skip_rationale:
+                text += f" {self.context_prefix}{context}"
+            if not self.skip_question:
+                text += f" {self.question_prefix}{item['question']}"
+            text += f" {self.answer_prefix}{item['reference']}"
+            text += f" {self.candidate_prefix}{item['candidate']}"
+            lengths.append(len(text))
+        return lengths
 
 
-class AToBDataset(Dataset):
-    def __init__(self, input_dataset, output_dataset):
-        """
-        A dataset that combines two datasets, where the text and labels of the first are used as input and the labels of the second as output.
-        :param input_dataset: Dataset containing input data with text and soft labels.
-        :param output_dataset: Dataset containing ratings to be predicted.
-        """
-        self.input_dataset = input_dataset
-        self.output_dataset = output_dataset
-        self.input_keys = list(input_dataset.keys())
-        self.output_keys = list(output_dataset.keys())
-        self.keys = [k for k in self.input_keys if k in self.output_keys]
+# Not used
+# class InferenceDataset(UnifiedAnnotationDataset):
+#     def __init__(self, *args, **kwargs):
+#         super().__init__(*args, **kwargs)
 
-    def __len__(self):
-        return len(self.keys)
-
-    def __getitem__(self, idx):
-        key = self.keys[idx]
-        input_idx = self.input_dataset.keys_to_id[key]
-        output_idx = self.output_dataset.keys_to_id[key]
-        input_item = self.input_dataset[input_idx]
-        output_item = self.output_dataset[output_idx]
-        input_text = input_item["text"]
-        input_ratings = input_item["soft_labels"]
-        input_text = input_text + " ".join(
-            [f" |rating {i}: {rating}" for i, rating in enumerate(input_ratings)]
-        )
-        return {
-            "text": input_text,
-            "soft_labels": output_item["soft_labels"],
-            "average_rating": output_item["average_rating"],
-            "rating_variance": output_item["rating_variance"],
-            "metadata": {
-                "input": input_item["metadata"],
-                "output": output_item["metadata"],
-            },
-            "prompt": input_item["prompt"],
-            "idx": self.keys[idx],
-            "annotation_id": input_item["annotation_id"],
-            "model_id": input_item["model_id"],
-        }
-
-
-class AAndBDataset(Dataset):
-    def __init__(self, dataset_a, dataset_b):
-        """
-        A dataset that combines two datasets, where the labels of both are returned separately.
-        :param dataset_a: First dataset containing input data with text and soft labels.
-        :param dataset_b: Second dataset containing input data with text and soft labels.
-        """
-        self.dataset_a = dataset_a
-        self.dataset_b = dataset_b
-        self.keys_a = list(dataset_a.keys())
-        self.keys_b = list(dataset_b.keys())
-        self.keys = [k for k in self.keys_a if k in self.keys_b]
-
-    def __len__(self):
-        return len(self.keys)
-
-    def __getitem__(self, idx):
-        key = self.keys[idx]
-        idx_a = self.dataset_a.keys_to_id[key]
-        idx_b = self.dataset_b.keys_to_id[key]
-        item_a = self.dataset_a[idx_a]
-        item_b = self.dataset_b[idx_b]
-        text = item_a["text"]
-        # assert item_a['text'] == item_b['text']
-        soft_labels_a = item_a["soft_labels"]
-        soft_labels_b = item_b["soft_labels"]
-        average_rating_a = item_a["average_rating"]
-        average_rating_b = item_b["average_rating"]
-        rating_variance_a = item_a["rating_variance"]
-        rating_variance_b = item_b["rating_variance"]
-        return {
-            "text": text,
-            "soft_labels": soft_labels_a,
-            "average_rating": average_rating_a,
-            "rating_variance": rating_variance_a,
-            "soft_labels_a": soft_labels_a,
-            "average_rating_a": average_rating_a,
-            "rating_variance_a": rating_variance_a,
-            "soft_labels_b": soft_labels_b,
-            "average_rating_b": average_rating_b,
-            "rating_variance_b": rating_variance_b,
-            "metadata": {"a": item_a["metadata"], "b": item_b["metadata"]},
-            "prompt": item_a["prompt"] + " " + item_b["prompt"],
-            "idx": self.keys[idx],
-            "annotation_id": item_a["annotation_id"],
-            "model_id": item_a["model_id"] + "_" + item_b["model_id"],
-        }
+#     def __getitem__(self, idx):
+#         item = self.annotations[self.annotation_keys[idx]]
+#         prompt = random.choice(self.prompts)
+#         context = item["rationale"]
+#         question = item["question"]
+#         answer = item["reference"]
+#         candidate_answer = item["candidate"]
+#         ratings = [0.0, 1.0]
+#         average_rating = sum(ratings) / len(ratings)
+#         rating_variance = sum((x - average_rating) ** 2 for x in ratings) / len(ratings)
+#         format_free = (
+#             f"{prompt} "
+#             f"{self.context_prefix}{context} "
+#             f"{self.question_prefix}{question} "
+#             f"{self.answer_prefix}{answer} "
+#             f"{self.candidate_prefix}{candidate_answer}"
+#         )
+#         model_id = self.model_ids[idx]
+#         return {
+#             "text": format_free,
+#             "soft_labels": ratings,
+#             "average_rating": average_rating,
+#             "rating_variance": rating_variance,
+#             "metadata": item,
+#             "prompt": prompt,
+#             "idx": self.annotation_keys[idx],
+#             "annotation_id": self.annotation_ids[idx],
+#             "model_id": model_id,
+#         }
 
 
 class ConcatenatedDataset(Dataset):
@@ -283,6 +240,55 @@ class ConcatenatedDataset(Dataset):
         for dataset in self.datasets:
             for item in dataset:
                 yield item
+
+    @property
+    def seq_lengths(self):
+        """Character lengths of each item across all concatenated datasets."""
+        return [length for ds in self.datasets for length in ds.seq_lengths]
+
+
+class BucketBatchSampler(Sampler):
+    """Batch sampler that groups sequences by length bucket to reduce padding waste.
+
+    Indices within each bucket are shuffled, and bucket order is also shuffled
+    each epoch, so training dynamics are preserved.
+    """
+
+    def __init__(self, lengths, batch_size, bucket_width=50, shuffle=True):
+        self.lengths = lengths
+        self.batch_size = batch_size
+        self.bucket_width = bucket_width
+        self.shuffle = shuffle
+
+    def __iter__(self):
+        # Group indices into buckets by character-length range
+        buckets: dict[int, list[int]] = {}
+        for idx, length in enumerate(self.lengths):
+            bucket_id = length // self.bucket_width
+            buckets.setdefault(bucket_id, []).append(idx)
+
+        # Shuffle within each bucket
+        if self.shuffle:
+            for indices in buckets.values():
+                random.shuffle(indices)
+
+        # Shuffle bucket order
+        bucket_keys = list(buckets.keys())
+        if self.shuffle:
+            random.shuffle(bucket_keys)
+
+        # Yield complete batches; drop last incomplete batch per bucket
+        for key in bucket_keys:
+            indices = buckets[key]
+            for i in range(0, len(indices) - len(indices) % self.batch_size, self.batch_size):
+                yield indices[i : i + self.batch_size]
+
+    def __len__(self):
+        buckets: dict[int, int] = {}
+        for length in self.lengths:
+            bucket_id = length // self.bucket_width
+            buckets[bucket_id] = buckets.get(bucket_id, 0) + 1
+        return sum(count // self.batch_size for count in buckets.values())
 
 
 class Converter(Dataset):
@@ -353,11 +359,12 @@ class CollateFn:
         all_soft_labels = [item["soft_labels"] for item in batch]
         all_average_ratings = [item["average_rating"] for item in batch]
         all_ratings_variance = [item["rating_variance"] for item in batch]
-        all_annotation_ids = [item["annotation_id"] for item in batch]
-        all_model_ids = [item["model_id"] for item in batch]
-        all_idxs = [item["idx"] for item in batch]
+        all_n_ratings = [item["n_ratings"] for item in batch]
+        # all_annotation_ids = [item["annotation_id"] for item in batch]
+        # all_model_ids = [item["model_id"] for item in batch]
+        all_idxs = [item["id"] for item in batch]
 
-        tokenized = tokenizer.batch_encode_plus(
+        tokenized = tokenizer(
             all_text,
             add_special_tokens=False,
             padding="longest",
@@ -387,6 +394,7 @@ class CollateFn:
         )
         average_labels = torch.tensor(all_average_ratings, dtype=torch.float)
         label_variance = torch.tensor(all_ratings_variance, dtype=torch.float)
+        n_ratings = torch.tensor(all_n_ratings, dtype=torch.long)
 
         extra_kwargs = {}
         if "soft_labels_a" in batch[0]:
@@ -434,11 +442,29 @@ class CollateFn:
                 "labels": labels,
                 "average_labels": average_labels,
                 "label_variance": label_variance,
+                "n_ratings": n_ratings,
                 "metadata": all_metadata,
                 "prompt": all_prompts,
-                "annotation_id": all_annotation_ids,
-                "model_id": all_model_ids,
+                # "annotation_id": all_annotation_ids,
+                # "model_id": all_model_ids,
                 "idx": all_idxs,
                 **extra_kwargs,
             }
         )
+
+
+if __name__ == "__main__":
+
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_jsonl", type=str, default="data/stage3_human/seed_42/train.jsonl")
+    parser.add_argument("--skip_question", action="store_true")
+    parser.add_argument("--skip_rationale", action="store_true")
+    parser.add_argument("--normalize_ratings", action="store_true")
+    args = parser.parse_args()
+
+    dataset = UnifiedAnnotationDataset(args.data_jsonl, normalize_ratings=args.normalize_ratings)
+    for item in dataset:
+        print(item)
+        break

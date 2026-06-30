@@ -100,7 +100,20 @@ def get_dataloaders(args, tokenizer, writer):
     else:
         prompts = None
 
+    # With FSDP each rank runs its own DataLoader workers.  4 processes × N workers
+    # quickly exhausts the OS thread limit, especially because HuggingFace tokenizers
+    # (rayon) spawn additional threads inside each worker.
+    # Clamp to at most 2 workers per process; 0 is safe and avoids the issue entirely.
+    import os as _os
+
+    num_processes = int(_os.environ.get("WORLD_SIZE", "1"))
+    num_workers = min(args.num_workers, max(0, 4 // num_processes))
+    prefetch = 2 if num_workers > 0 else None
+
     collate_fn = data.CollateFn(tokenizer)
+    # multinomial_llh expects raw integer ratings [1,5]; normalize_ratings=False
+    # preserves them.  All other score types use [0,1]-normalised floats.
+    normalize_ratings = args.score_type != "multinomial"
     if args.dataset_sampling_weights is None:
         train_dataset = data.ConcatenatedDataset(
             [
@@ -112,18 +125,35 @@ def get_dataloaders(args, tokenizer, writer):
                     skip_question=args.skip_question,
                     add_transcript=args.add_transcript,
                     log_fn=lambda msg: writer.log(msg, to_console=True),
+                    normalize_ratings=normalize_ratings,
                 )
                 for jfile in args.train_data
             ]
         )
-        train_dataloader = DataLoader(
-            train_dataset,
-            batch_size=args.batch_size,
-            shuffle=True,
-            num_workers=args.num_workers,
-            collate_fn=collate_fn,
-            pin_memory=True,
-        )
+        if args.bucket_width > 0:
+            train_sampler = data.BucketBatchSampler(
+                train_dataset.seq_lengths,
+                args.batch_size,
+                bucket_width=args.bucket_width,
+            )
+            train_dataloader = DataLoader(
+                train_dataset,
+                batch_sampler=train_sampler,
+                num_workers=num_workers,
+                collate_fn=collate_fn,
+                pin_memory=False,
+                prefetch_factor=prefetch,
+            )
+        else:
+            train_dataloader = DataLoader(
+                train_dataset,
+                batch_size=args.batch_size,
+                shuffle=True,
+                num_workers=num_workers,
+                collate_fn=collate_fn,
+                pin_memory=False,
+                prefetch_factor=prefetch,
+            )
     else:
         train_datasets = [
             data.UnifiedAnnotationDataset(
@@ -134,6 +164,7 @@ def get_dataloaders(args, tokenizer, writer):
                 skip_question=args.skip_question,
                 add_transcript=args.add_transcript,
                 log_fn=lambda msg: writer.log(msg, to_console=True),
+                normalize_ratings=normalize_ratings,
             )
             for jfile in args.train_data
         ]
@@ -143,9 +174,10 @@ def get_dataloaders(args, tokenizer, writer):
                 train_dataset,
                 batch_size=args.batch_size,
                 shuffle=True,
-                num_workers=0,
+                num_workers=num_workers,
                 collate_fn=collate_fn,
-                pin_memory=True,
+                pin_memory=False,
+                prefetch_factor=prefetch,
             )
             for train_dataset in train_datasets
         ]
@@ -156,8 +188,10 @@ def get_dataloaders(args, tokenizer, writer):
             train_dataset,
             batch_size=1,
             shuffle=True,
-            num_workers=args.num_workers,
+            num_workers=num_workers,
             collate_fn=lambda x: x[0],
+            pin_memory=False,
+            prefetch_factor=prefetch,
         )
 
     val_dataset = data.UnifiedAnnotationDataset(
@@ -166,14 +200,17 @@ def get_dataloaders(args, tokenizer, writer):
         skip_rationale=args.skip_rationale,
         skip_question=args.skip_question,
         log_fn=lambda msg: writer.log(msg, to_console=True),
+        normalize_ratings=normalize_ratings,
     )
 
     val_dataloader = DataLoader(
         val_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
+        shuffle=False,
+        num_workers=num_workers,
         collate_fn=collate_fn,
+        pin_memory=False,
+        prefetch_factor=prefetch,
     )
 
     writer.log(f"Total number of training samples: {len(train_dataset)}", to_console=True)
@@ -189,13 +226,12 @@ def build_model(args, accelerator, device, writer):
     attn_impl = "flash_attention_2" if args.use_flash_attention else None
 
     # Log model loading info
-    if accelerator.is_main_process:
-        precision = args.quantization_level if args.quantization_level != "none" else "bfloat16"
-        flash_attn = " with Flash Attention 2" if args.use_flash_attention else ""
-        writer.log(
-            f"Loading {args.model} with {precision} precision{flash_attn}",
-            to_console=True,
-        )
+    precision = args.quantization_level if args.quantization_level != "none" else "bfloat16"
+    flash_attn = " with Flash Attention 2" if args.use_flash_attention else ""
+    writer.log(
+        f"Loading {args.model} with {precision} precision{flash_attn}",
+        to_console=True,
+    )
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=args.quantization_level == "4bit",
         load_in_8bit=args.quantization_level == "8bit",
@@ -203,21 +239,28 @@ def build_model(args, accelerator, device, writer):
         bnb_4bit_use_double_quant=True,
         bnb_4bit_quant_type="nf4",
     )
+    # For FSDP (num_processes > 1): do NOT pass device_map — HuggingFace's device_map
+    # attaches dispatch hooks that conflict with FSDP's own sharding mechanism.
+    # Load to CPU naturally; accelerator.prepare() shards across GPUs.
+    # For single-GPU: load directly onto the target device via device_map.
+    if accelerator.num_processes > 1:
+        load_kwargs = {"low_cpu_mem_usage": True}
+    else:
+        load_kwargs = {"device_map": device.type, "low_cpu_mem_usage": True}
+
     if args.quantization_level == "none":
         lm = AutoModelForCausalLM.from_pretrained(
             args.model,
             dtype=torch.bfloat16,
             attn_implementation=attn_impl,
-            device_map=device.type,
-            low_cpu_mem_usage=True,
+            **load_kwargs,
         )
     else:
         lm = AutoModelForCausalLM.from_pretrained(
             args.model,
             attn_implementation=attn_impl,
             quantization_config=bnb_config,
-            device_map=device.type,
-            low_cpu_mem_usage=True,
+            **load_kwargs,
         )
 
     if args.tokenizer is not None:
@@ -227,7 +270,7 @@ def build_model(args, accelerator, device, writer):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    tokenizer.padding_side = "left"
+    tokenizer.padding_side = "right"
 
     start_step = 0
     best_val_rho = float("-inf")
@@ -237,28 +280,37 @@ def build_model(args, accelerator, device, writer):
         # (resume): recover interrupted run — restore weights, optimizer, and step counter
         if args.load_checkpoint:
             ckpt_dir = os.path.join(args.load_checkpoint, "model")
-            if accelerator.is_main_process:
-                writer.log(f"Loading model from checkpoint: {ckpt_dir}", to_console=True)
+            writer.log(f"Loading model from checkpoint: {ckpt_dir}", to_console=True)
         else:
             ckpt_dir = os.path.join(args.output_dir, "latest", "model")
-            if accelerator.is_main_process:
-                writer.log("Resuming from latest checkpoint", to_console=True)
+            writer.log("Resuming from latest checkpoint", to_console=True)
 
         if args.lora_rank is not None:
-            lm = PeftModel.from_pretrained(lm, os.path.join(ckpt_dir, "lm"), is_trainable=True)
-            if accelerator.is_main_process:
-                writer.log("Loaded LoRA adapters from checkpoint", to_console=True)
-
+            # torch_device="cpu": load adapter weights to CPU regardless of what
+            # peft's infer_device() would pick.  infer_device() returns "cuda"
+            # (no index), which resolves to cuda:current_device().  Under FSDP
+            # with fsdp_cpu_ram_efficient_loading=True, the base model on non-rank-0
+            # processes lives on the meta device, so CUDA has never been
+            # initialised for that process yet and current_device() defaults to 0
+            # on every rank — both processes race for cuda:0 and rank 1 receives
+            # cudaErrorDevicesUnavailable.  Loading to CPU is correct here anyway:
+            # accelerator.prepare() / FSDP wrapping moves everything to the right
+            # GPU device afterwards.
+            lm = PeftModel.from_pretrained(
+                lm, os.path.join(ckpt_dir, "lm"), is_trainable=True, torch_device="cpu"
+            )
+            writer.log("Loaded LoRA adapters from checkpoint", to_console=True)
         else:
             lm = AutoModelForCausalLM.from_pretrained(
                 os.path.join(ckpt_dir, "lm"),
                 dtype=torch.bfloat16,
                 attn_implementation=attn_impl,
             )
-            if accelerator.is_main_process:
-                writer.log("Loaded full LM from checkpoint", to_console=True)
+            writer.log("Loaded full LM from checkpoint", to_console=True)
 
-        scoring_model = model.ORCA.load_from_directory(ckpt_dir, lm, device=device)
+        scoring_model = model.ORCA.load_from_directory(
+            ckpt_dir, lm, device=None if accelerator.num_processes > 1 else device
+        )
 
         if args.resume:
             latest_checkpoint = os.path.join(args.output_dir, "latest")
@@ -268,6 +320,7 @@ def build_model(args, accelerator, device, writer):
             best_val_rho = (
                 all_metrics[-1].get("mean_rho", best_val_rho) if all_metrics else float("-inf")
             )
+            writer.log(f"Resumed model from checkpoint at step {start_step}", to_console=True)
     else:
         # (fresh training): apply LoRA (if requested) and construct ORCA from scratch
         if args.lora_rank is not None:
@@ -287,11 +340,10 @@ def build_model(args, accelerator, device, writer):
             )
             lm = get_peft_model(lm, lora_config)
             if hasattr(lm.config, "tie_word_embeddings") and lm.config.tie_word_embeddings:
-                if accelerator.is_main_process:
-                    writer.log(
-                        "INFO: Model has tied word embeddings. Input embeddings share weights with lm_head.",
-                        to_console=True,
-                    )
+                writer.log(
+                    "INFO: Model has tied word embeddings. Input embeddings share weights with lm_head.",
+                    to_console=True,
+                )
 
         scoring_model = model.ORCA(
             lm,
@@ -308,15 +360,13 @@ def build_model(args, accelerator, device, writer):
         if hasattr(scoring_model.lm, "lm_head") and not embeddings_tied:
             for param in scoring_model.lm.lm_head.parameters():
                 param.requires_grad = False
-            if accelerator.is_main_process:
-                writer.log("Frozen lm_head (not used for scoring)", to_console=True)
+            writer.log("Frozen lm_head (not used for scoring)", to_console=True)
         elif hasattr(scoring_model.lm, "lm_head") and embeddings_tied:
-            if accelerator.is_main_process:
-                writer.log(
-                    "WARNING: Keeping lm_head trainable because embeddings are tied",
-                    level="WARNING",
-                    to_console=True,
-                )
+            writer.log(
+                "WARNING: Keeping lm_head trainable because embeddings are tied",
+                level="WARNING",
+                to_console=True,
+            )
 
     return scoring_model, tokenizer, start_step, best_val_rho
 
@@ -341,10 +391,13 @@ def build_optimizer_and_scheduler(args, scoring_model, accelerator, writer):
         optimizer_dict_list, lr=args.peak_lr, weight_decay=args.weight_decay
     )
     if args.resume:
-        if accelerator.is_main_process:
+        if accelerator.num_processes == 1:
+            # Single-GPU: restore optimizer state directly from optimizer.pt.
+            # FSDP: optimizer state is rank-local/sharded; it is restored via
+            # accelerator.load_state() after accelerator.prepare() in main().
             writer.log("Resuming optimizer state from checkpoint", to_console=True)
-        latest_checkpoint = os.path.join(args.output_dir, "latest")
-        optimizer.load_state_dict(torch.load(os.path.join(latest_checkpoint, "optimizer.pt")))
+            latest_checkpoint = os.path.join(args.output_dir, "latest")
+            optimizer.load_state_dict(torch.load(os.path.join(latest_checkpoint, "optimizer.pt")))
     lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer, lr_lambda=partial(lr_lambda_linear_with_min_lr, args=args)
     )
@@ -449,6 +502,13 @@ def evaluate(
             all_val_variance_annotations.extend(result_data["annotations_variance"])
             all_val_variance_predictions.extend(result_data["predictions_variance"])
 
+    # For multinomial, ground-truth average_labels and label_variance are in
+    # [1,5] / [0,16] space (normalize_ratings=False); scale them down to [0,1]
+    # so MAE is comparable with beta/bernoulli. Predictions are already in [0,1].
+    if args.score_type == "multinomial":
+        all_val_annotations = [(r - 1) / 4 for r in all_val_annotations]
+        all_val_variance_annotations = [v / 16 for v in all_val_variance_annotations]
+
     metrics = compute_metrics(
         all_val_annotations,
         all_val_predictions,
@@ -502,14 +562,18 @@ def main():
 
     args = parse_arguments()
 
+    # Disable HuggingFace tokenizer parallelism: tokenizers use rayon internally and
+    # will try to spawn threads inside each DataLoader worker, quickly exhausting the
+    # OS thread limit when running multiple FSDP processes.
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
     # Set random seeds for reproducibility
     set_seeds(args.seed)
 
-    ddp_kwargs = accelerate.utils.DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = accelerate.Accelerator(
         gradient_accumulation_steps=args.accumulation_steps,
-        kwargs_handlers=[ddp_kwargs],
     )
+    print("CUDA_VISIBLE_DEVICES:", os.environ.get("CUDA_VISIBLE_DEVICES", "Not set"))
     torch.tensor(0).to(accelerator.device)
     device = accelerator.device
 
@@ -528,12 +592,15 @@ def main():
         with open(os.path.join(args.output_dir, "args.yaml"), "w") as f:
             yaml.dump(args_dict, f)
 
-    # Create writer for logging
+    # Create writer for logging.
+    # is_main_process=False makes all methods no-ops on non-main processes,
+    # so no file handles are opened and log rotation cannot race.
     jsonl_log_path = os.path.join(args.output_dir, "training_metrics.jsonl")
     tensorboard_dir = os.path.join(args.log_dir, args.exp_name) if args.log_dir else None
     writer = CompositeWriter(
         log_dir=tensorboard_dir,
         jsonl_path=jsonl_log_path,
+        is_main_process=accelerator.is_main_process,
         resume=args.resume,
         console_print_fn=accelerator.print,
     )
@@ -542,10 +609,7 @@ def main():
     writer.log(f"Experiment name: {args.exp_name}", to_console=True)
     writer.log(f"TensorBoard logs: {tensorboard_dir}", to_console=True)
     writer.log(f"Training log: {writer.text_log_path}", to_console=True)
-
-    # Log initial configuration (only main process writes)
-    if accelerator.is_main_process:
-        writer.log(" ".join(sys.argv))
+    writer.log(" ".join(sys.argv))
 
     # Build model and tokenizer - load from checkpoint if specified
     scoring_model, tokenizer, start_step, best_val_rho = build_model(
@@ -560,9 +624,45 @@ def main():
         args, scoring_model, accelerator, writer
     )
 
+    # For FSDP TRANSFORMER_BASED_WRAP: detect the decoder layer class at runtime so
+    # the same accelerate config works across all model families (Gemma, Llama, Qwen…).
+    # transformers sets _no_split_modules on every model to the list of layer class names
+    # that should not be split — exactly what FSDP should wrap individually.
+    if accelerator.num_processes > 1 and hasattr(accelerator.state, "fsdp_plugin"):
+        base_lm = scoring_model.lm
+        # PeftModel wraps the transformer as base_model.model
+        if hasattr(base_lm, "base_model"):
+            base_lm = base_lm.base_model.model
+        no_split = getattr(base_lm, "_no_split_modules", None)
+        if no_split:
+            accelerator.state.fsdp_plugin.transformer_layer_cls_to_wrap = set(no_split)
+            writer.log(f"FSDP: wrapping transformer layers: {no_split}", to_console=True)
+        else:
+            writer.log(
+                "WARNING: _no_split_modules not found on model; FSDP will only wrap the root module.",
+                level="WARNING",
+                to_console=True,
+            )
+
     scoring_model, optimizer, train_dataloader, val_dataloader, lr_scheduler = accelerator.prepare(
         scoring_model, optimizer, train_dataloader, val_dataloader, lr_scheduler
     )
+
+    # FSDP resume: restore per-rank sharded optimizer and lr_scheduler state.
+    # Must run after accelerator.prepare() so FSDP sharding is already in place.
+    # accelerator.load_state() is a collective operation — all ranks participate.
+    if args.resume and accelerator.num_processes > 1:
+        fsdp_state_dir = os.path.join(args.output_dir, "latest", "fsdp_state")
+        if os.path.isdir(fsdp_state_dir):
+            accelerator.load_state(fsdp_state_dir)
+            writer.log("Restored FSDP optimizer/scheduler state from fsdp_state/", to_console=True)
+        else:
+            writer.log(
+                "WARNING: --resume with FSDP but no fsdp_state/ found.",
+                level="WARNING",
+                to_console=True,
+            )
+            sys.exit()
 
     total_params = sum(p.numel() / 1e6 for p in scoring_model.parameters())
     trainable_params = sum(p.numel() / 1e6 for p in scoring_model.parameters() if p.requires_grad)
@@ -580,6 +680,7 @@ def main():
     metrics_at_best_checkpoint = []
     train_loss = 0
     train_count = 0
+    j = start_step  # ensure j is defined even if the training loop is skipped (e.g. resume at max_steps)
 
     train_loader_iter = iter(train_dataloader)
     scoring_model.train()
@@ -670,6 +771,10 @@ def main():
                         grad_norm = accelerator.clip_grad_norm_(
                             scoring_model.parameters(), args.max_grad_norm
                         )
+                        # clip_grad_norm_ returns a DTensor under FSDP; extract scalar
+                        grad_norm = (
+                            grad_norm.item() if hasattr(grad_norm, "item") else float(grad_norm)
+                        )
                         # Average loss across all samples in this step
                         avg_step_loss = step_loss_sum / step_num_samples
                         train_loss += avg_step_loss
@@ -750,18 +855,25 @@ def main():
                             f"Step {j}: New best validation rho: {best_val_rho:.6f} - Saved checkpoint to 'best'",
                             to_console=True,
                         )
-                if accelerator.is_main_process:
-                    save_checkpoint(
-                        scoring_model,
-                        os.path.join(args.output_dir, "latest"),
-                        accelerator=accelerator,
-                        metrics=all_metrics,
-                        args=args,
-                        optimizer=optimizer,
-                        tokenizer=tokenizer,
-                    )
+                # All ranks must call save_checkpoint so FSDP's get_state_dict
+                # collective all-gather can complete; rank 0 writes the files.
+                save_checkpoint(
+                    scoring_model,
+                    os.path.join(args.output_dir, "latest"),
+                    accelerator=accelerator,
+                    metrics=all_metrics,
+                    args=args,
+                    optimizer=optimizer,
+                    tokenizer=tokenizer,
+                )
+                # FSDP: save per-rank sharded optimizer and lr_scheduler state so
+                # training can be correctly resumed.  All ranks must call this;
+                # accelerator.save_state() is a collective operation.
+                if accelerator.num_processes > 1:
+                    accelerator.save_state(os.path.join(args.output_dir, "latest", "fsdp_state"))
 
-            if accelerator.is_main_process and j % args.save_steps == 0:
+            if j % args.save_steps == 0:
+                # All ranks participate in FSDP gather; only rank 0 writes files
                 save_checkpoint(
                     scoring_model,
                     os.path.join(args.output_dir, f"checkpoint_{j}"),
@@ -880,7 +992,7 @@ def parse_arguments():
         "--score_type",
         type=str,
         default="beta",
-        choices=["bernoulli", "beta"],
+        choices=["bernoulli", "beta", "multinomial"],
         help="Type of scoring to use for training the model.",
     )
     model_group.add_argument(
@@ -967,13 +1079,19 @@ def parse_arguments():
     training_group.add_argument(
         "--early_stopping_patience",
         type=int,
-        default=30,
+        default=5,
         help="Number of validation steps without improvement before early stopping.",
     )
 
     # batch size and accumulation
     training_group.add_argument(
         "--batch_size", type=int, default=8, help="Batch size for training."
+    )
+    training_group.add_argument(
+        "--bucket_width",
+        type=int,
+        default=50,
+        help="Character-length bucket width for efficient batch sampling. 0 to disable (random shuffle).",
     )
     training_group.add_argument(
         "--accumulation_steps",

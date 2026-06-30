@@ -2,7 +2,12 @@ exp
 .cache
 misc
 tex
+scripts
+*_server
+logs
 
+
+*.bak
 *.*~
 *.sh
 
@@ -10,3 +15,14 @@ __pycache__
 
 .venv
 .vscode
+.env
+.gurthu
+
+data/stage*
+data/seed*
+
+
+tmp
+tsks
+data/*.json
+config/
