@@ -12,8 +12,7 @@
 >
 > **Paper:** The pre-MIT Press publication version is [on arXiv](https://arxiv.org/abs/2512.09066)
 
-ORCA is a framework for assessing the correctness of open-ended responses, particularly for audio question-answering tasks. The system uses language model representations and models the correctness of a response using Beta distribution thereby capturing both the mean and uncertainty (variance) of correctness score. The ORCA score strongly correlates with average human judgement and effectively captures the interpretive uncertainty.
-
+**Abstract:** Reliable assessment of the abilities of large audio language models (LALMs) is essential to advancing the state of the art. As benchmarks rapidly evolve to incorporate complex reasoning and subjective tasks, they increasingly necessitate open-ended responses from LALMs. We present Open-ended Response Correctness Assessment (ORCA) -- a reliable and lightweight model-based approach for answer correctness and disagreement modeling. We employ a three-stage annotation pipeline combining human judgment, structured feedback, and human-AI correction, yielding 9,663 annotations across 3,699 question-answer pairs from 15 LALMs on three audio understanding and reasoning benchmarks (achieving a Krippendorff's alpha of 0.82). Our experiments employing curriculum learning show that ORCA models achieve a Spearman correlation of 0.91 with average human correctness ratings on seen benchmarks and generalize to unseen benchmarks with a score of 0.85, outperforming several LLM judge baselines including Gemini 2.5 Flash. Furthermore, we demonstrate that ORCA's predicted variance correlates strongly with human disagreement, allowing it to effectively identify problematic benchmark items.
 
 - **Training datasets** on [Hugging Face](https://huggingface.co/datasets/BUT-FIT/orca-audio-qa-annotations)
 - **Pre-trained models** on Hugging Face:
