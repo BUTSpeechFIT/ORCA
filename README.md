@@ -8,8 +8,8 @@
 ⁴Tufts University, USA &nbsp;·&nbsp;
 ⁵University of Maryland, USA
 
-**Paper:** [arXiv:2512.09066](https://arxiv.org/abs/2512.09066) — accepted to *TACL 2026*  
-**Dataset:** [BUT-FIT/orca-audio-qa-annotations](https://huggingface.co/datasets/BUT-FIT/orca-audio-qa-annotations)  
+**Paper:** [https://doi.org/10.1162/TACL.a.798](https://doi.org/10.1162/TACL.a.798) — accepted to *TACL 2026*
+**Dataset:** [BUT-FIT/orca-audio-qa-annotations](https://huggingface.co/datasets/BUT-FIT/orca-audio-qa-annotations)
 **Models:** [orca-gemma-3-4b-it-multinomial](https://huggingface.co/BUT-FIT/orca-gemma-3-4b-it-multinomial) · [orca-llama-3.2-3b-it-multinomial](https://huggingface.co/BUT-FIT/orca-llama-3.2-3b-it-multinomial) · [orca-olmo-2-1b-multinomial](https://huggingface.co/BUT-FIT/orca-olmo-2-1b-multinomial)
 
 ---
@@ -17,6 +17,10 @@
 **Abstract:** Reliable assessment of the abilities of large audio language models (LALMs) is essential to advancing the state of the art. As benchmarks rapidly evolve to incorporate complex reasoning and subjective tasks, they increasingly necessitate open-ended responses from LALMs. We present Open-ended Response Correctness Assessment (ORCA) — a reliable and lightweight model-based approach for answer correctness and disagreement modeling. We employ a three-stage annotation pipeline combining human judgment, structured feedback, and human-AI correction, yielding 9,663 annotations across 3,699 question-answer pairs from 15 LALMs on three audio understanding and reasoning benchmarks (achieving a Krippendorff's alpha of 0.82). Our experiments employing curriculum learning show that ORCA models achieve a Spearman correlation of 0.91 with average human correctness ratings on seen benchmarks and generalize to unseen benchmarks with a score of 0.85, outperforming several LLM judge baselines including Gemini 2.5 Flash. Furthermore, we demonstrate that ORCA's predicted variance correlates strongly with human disagreement, allowing it to effectively identify problematic benchmark items.
 
 ---
+
+## Corrected benchmarks
+
+The [corrected MMAU and MMAR benchmarks](benchmarks/README.md) can be used for open-ended evaluation.
 
 ## Installation
 
@@ -104,11 +108,18 @@ download_and_infer.py   # End-to-end convenience script
 
 ```bibtex
 @article{sedlacek-etal-2026-orca,
-  title={ORCA: Open-ended Response Correctness Assessment for Audio Question Answering},
-  author={Sedl\'{a}\v{c}ek, \v{S}imon and Barahona, Sara and Herrera-Alarc\'{o}n, Laura and Kesiraju, Santosh and Bola\~{n}os, Cecilia and Lozano-Diez, Alicia and Udupa, Sathvik and L\'{o}pez, Fernando and Ferner, Allison and Yusuf, Bolaji and Duraiswami, Ramani and \v{C}ernock\'{y}, Jan},
-  howpublished={Accepted to Transactions of the Association for Computational Linguistics},
-  year={2026},
-  url={https://arxiv.org/abs/2512.09066}
+    author = {Sedláček, Šimon and Barahona, Sara and Bolaños, Cecilia and Herrera-Alarcón, Laura and Udupa, Sathvik and López, Fernando and Ferner, Allison and Yusuf, Bolaji and Lozano-Diez, Alicia and Kesiraju, Santosh and Duraiswami, Ramani and Černocký, Jan},
+    title = "{ORCA: Open-ended Response Correctness Assessment for Audio Question Answering}",
+    journal = {Transactions of the Association for Computational Linguistics},
+    volume = {14},
+    pages = {2213-2233},
+    year = {2026},
+    month = {08},
+    abstract = {Reliable assessment of the abilities of large audio language models (LALMs) is essential to advancing the state of the art. As benchmarks rapidly evolve to incorporate complex reasoning and subjective tasks, they increasingly necessitate open-ended responses from LALMs. We present Open-ended Response Correctness Assessment (ORCA)—a reliable and lightweight model-based approach for answer correctness and disagreement modeling. We employ a three-stage annotation pipeline combining human judgment, structured feedback, and human-AI correction, yielding 9,663 annotations across 3,699 question-answer pairs from 15 LALMs on three audio understanding and reasoning benchmarks (achieving a Krippendorff’s alpha of 0.82). Our experiments employing curriculum learning show that ORCA models achieve a Spearman correlation of 0.91 with average human correctness ratings on seen benchmarks and generalize to unseen benchmarks with a score of 0.85, outperforming several LLM judge baselines including Gemini 2.5 Flash. Furthermore, we demonstrate that ORCA’s predicted variance correlates strongly with human disagreement, allowing it to effectively identify problematic benchmark items.},
+    issn = {2307-387X},
+    doi = {10.1162/TACL.a.798},
+    url = {https://doi.org/10.1162/TACL.a.798},
+    eprint = {https://direct.mit.edu/tacl/article-pdf/doi/10.1162/TACL.a.798/2624638/tacl.a.798.pdf},
 }
 ```
 
