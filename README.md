@@ -8,9 +8,18 @@
 ⁴Tufts University, USA &nbsp;·&nbsp;
 ⁵University of Maryland, USA
 
-**Paper:** [https://doi.org/10.1162/TACL.a.798](https://doi.org/10.1162/TACL.a.798) — accepted to *TACL 2026*
+**Paper:** [https://doi.org/10.1162/TACL.a.798](https://doi.org/10.1162/TACL.a.798) -- accepted to *Transactions of the ACL 2026*
+
 **Dataset:** [BUT-FIT/orca-audio-qa-annotations](https://huggingface.co/datasets/BUT-FIT/orca-audio-qa-annotations)
-**Models:** [orca-gemma-3-4b-it-multinomial](https://huggingface.co/BUT-FIT/orca-gemma-3-4b-it-multinomial) · [orca-llama-3.2-3b-it-multinomial](https://huggingface.co/BUT-FIT/orca-llama-3.2-3b-it-multinomial) · [orca-olmo-2-1b-multinomial](https://huggingface.co/BUT-FIT/orca-olmo-2-1b-multinomial)
+
+**Corrected benchmarks:**
+
+The [corrected and rephrased MMAU and MMAR benchmarks](benchmarks/README.md) can be used for open-ended evaluation.
+
+**Models:** 
+- [orca-gemma-3-4b-it-multinomial](https://huggingface.co/BUT-FIT/orca-gemma-3-4b-it-multinomial) 
+- [orca-llama-3.2-3b-it-multinomial](https://huggingface.co/BUT-FIT/orca-llama-3.2-3b-it-multinomial)
+- [orca-olmo-2-1b-multinomial](https://huggingface.co/BUT-FIT/orca-olmo-2-1b-multinomial)
 
 ---
 
@@ -18,9 +27,6 @@
 
 ---
 
-## Corrected benchmarks
-
-The [corrected MMAU and MMAR benchmarks](benchmarks/README.md) can be used for open-ended evaluation.
 
 ## Installation
 
