@@ -4,8 +4,8 @@ This directory contains corrected release versions of the MMAU test-mini benchma
 
 The corrected files are:
 
-- `MMAU_test_mini_corrected.jsonl`
-- `mmar_test_mini_corrected.jsonl`
+- `MMAU_test_mini_open_ended_corrected.jsonl`
+- `MMAR_open_ended_corrected.jsonl`
 
 ## What was corrected
 
