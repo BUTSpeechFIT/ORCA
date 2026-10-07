@@ -54,9 +54,9 @@ python download_and_infer.py --model gemma-4b --benchmark mmau-pro
 ```
 
 Available options:
-- `--model`: `gemma-4b` (default: `olmo-1b`), `llama-3b`, `olmo-1b`
+- `--model`: `gemma-4b`, `llama-3b`, `olmo-1b` (default)
 - `--benchmark`: `mmau-pro` (default), `mmau-mmar`
-- `--stages 1 2 3 4`: run all steps (default) or a subset — e.g. `--stages 3 4` to skip downloading
+- `--stages 1 2 3 4`: run all steps (default) or a subset -- e.g. `--stages 3 4` to skip downloading
 - `--var_threshold`: override the clamping threshold (default: per-model calibrated value)
 
 Results are written to `results/<model>/<benchmark>/final_result.jsonl` (`rating_orca`, `variance_orca` per item) and `score_clamp.yaml` (Spearman, Kendall, MAE).
@@ -124,7 +124,6 @@ download_and_infer.py   # End-to-end convenience script
     pages = {2213-2233},
     year = {2026},
     month = {08},
-    abstract = {Reliable assessment of the abilities of large audio language models (LALMs) is essential to advancing the state of the art. As benchmarks rapidly evolve to incorporate complex reasoning and subjective tasks, they increasingly necessitate open-ended responses from LALMs. We present Open-ended Response Correctness Assessment (ORCA)—a reliable and lightweight model-based approach for answer correctness and disagreement modeling. We employ a three-stage annotation pipeline combining human judgment, structured feedback, and human-AI correction, yielding 9,663 annotations across 3,699 question-answer pairs from 15 LALMs on three audio understanding and reasoning benchmarks (achieving a Krippendorff’s alpha of 0.82). Our experiments employing curriculum learning show that ORCA models achieve a Spearman correlation of 0.91 with average human correctness ratings on seen benchmarks and generalize to unseen benchmarks with a score of 0.85, outperforming several LLM judge baselines including Gemini 2.5 Flash. Furthermore, we demonstrate that ORCA’s predicted variance correlates strongly with human disagreement, allowing it to effectively identify problematic benchmark items.},
     issn = {2307-387X},
     doi = {10.1162/TACL.a.798},
     url = {https://doi.org/10.1162/TACL.a.798},

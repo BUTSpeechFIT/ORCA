@@ -17,12 +17,36 @@ __pycache__
 .vscode
 .env
 .gurthu
+*.png
+*.pdf
+*.tex
+*.json
+*.jsonl
+*.pt
+*.yaml
+*.jinja
+*.model
+*.safetensors
+*.pkl
+*.bin
+
+benchmarks/*.py
+benchmarks/*/*.py
+
+data
 
 data/stage*
 data/seed*
 
-
+analysis/
 tmp
 tsks
 data/*.json
 config/
+
+obsolete
+tests
+notebooks
+exp_scratch
+
+benchmarks

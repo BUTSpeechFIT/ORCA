@@ -71,18 +71,33 @@ answer: "Church"
 
 ## Citations
 
-### MMAU
+### [MMAU](https://sakshi113.github.io/mmau_homepage/)
 
-> *MMAU: A Massive Multi-Task Audio Understanding and Reasoning Benchmark.* Original benchmark paper. See the [MMAU project](https://github.com/SakshiAgarwal2025/MMAU) for the benchmark and publication details.
+```bibtex
+@inproceedings{sakshi2025mmau,
+  title  = {{MMAU}: A Massive Multi-Task Audio Understanding and Reasoning Benchmark},
+  author = {S Sakshi and Utkarsh Tyagi and Sonal Kumar and Ashish Seth and Ramaneswaran Selvakumar and Oriol Nieto and Ramani Duraiswami and Sreyan Ghosh and Dinesh Manocha},
+booktitle = {The Thirteenth International Conference on Learning Representations},
+  year    = {2025},
+  url = {https://openreview.net/forum?id=TeVAZXr3yv}
+}
+```
 
-### MMAR
+
+### [MMAR](https://github.com/ddlBoJack/MMAR)
 
 ```bibtex
 @inproceedings{mmar2025,
-  title     = {MMAR: A Challenging Benchmark for Deep Reasoning in Speech, Audio, Music, and Their Mix},
-  booktitle = {Proceedings of the International Conference on Multimedia and Expo Workshops},
-  year      = {2025},
-  doi       = {10.52202/085713-2252}
+  author = {Ma, Ziyang and Ma, Yinghao and Zhu, Yanqiao and Yang, Chen and Chao, Yi-Wen and Xu, Ruiyang and Chen, Wenxi and Chen, Yuanzhe and Chen, Zhuo and Cong, Jian and Li, Kai and Li, Keliang and Li, Siyou and Li, Xinfeng and Li, Xiquan and Lian, Zheng and Liang, Yuzhe and Liu, Minghao and Niu, Zhikang and Wang, Tianrui and Yuping, Wang and Wang, Yuxuan and Wu, Yihao and Yang, Guanrou and Yu, Jianwei and Yuan, Ruibin and Zheng, Zhisheng and Zhou, Ziya and Zhu, Haina and Xue, Wei and Benetos, Emmanouil and Yu, Kai and Chng, Eng-Siong and Chen, Xie},
+ booktitle = {Advances in Neural Information Processing Systems},
+ doi = {10.52202/085713-2252},
+ editor = {D. Belgrave and C. Zhang and H. Lin and R. Pascanu and P. Koniusz and M. Ghassemi and N. Chen},
+ pages = {},
+ publisher = {Curran Associates, Inc.},
+ title = {MMAR: A Challenging Benchmark for Deep Reasoning in Speech, Audio, Music, and Their Mix},
+ url = {https://proceedings.neurips.cc/paper_files/paper/2025/file/610a7d6507d55be70c6d13d0b663227d-Paper-Datasets_and_Benchmarks_Track.pdf},
+ volume = {38, Main Conference},
+ year = {2025}
 }
 ```
 
@@ -91,12 +106,15 @@ answer: "Church"
 ```bibtex
 @article{sedlacek-etal-2026-orca,
     author = {Sedláček, Šimon and Barahona, Sara and Bolaños, Cecilia and Herrera-Alarcón, Laura and Udupa, Sathvik and López, Fernando and Ferner, Allison and Yusuf, Bolaji and Lozano-Diez, Alicia and Kesiraju, Santosh and Duraiswami, Ramani and Černocký, Jan},
-    title = {ORCA: Open-ended Response Correctness Assessment for Audio Question Answering},
+    title = "{ORCA: Open-ended Response Correctness Assessment for Audio Question Answering}",
     journal = {Transactions of the Association for Computational Linguistics},
     volume = {14},
-    pages = {2213--2233},
+    pages = {2213-2233},
     year = {2026},
+    month = {08},
+    issn = {2307-387X},
     doi = {10.1162/TACL.a.798},
-    url = {https://doi.org/10.1162/TACL.a.798}
+    url = {https://doi.org/10.1162/TACL.a.798},
+    eprint = {https://direct.mit.edu/tacl/article-pdf/doi/10.1162/TACL.a.798/2624638/tacl.a.798.pdf},
 }
 ```
