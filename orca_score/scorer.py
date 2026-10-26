@@ -4,6 +4,7 @@
 
     # one pair (the model is loaded on the first call and kept for later calls)
     result = score(
+        model="gemma-4b",            # always give the model explicitly
         question="Does the alarm sound in front of the listener or behind him?",
         reference="behind",
         candidate="The alarm sounds behind the listener.",
@@ -12,6 +13,7 @@
     result["orca_score"]          # predicted correctness in [0, 1]
     result["orca_variance"]       # predicted variance of the human ratings (annotator disagreement)
     result["orca_score_clamped"]  # clamped score; None if no clamping threshold is set
+    result["orca_model"]          # model name, date of its last update and commit
 
     # many pairs, with a model of your choice
     scorer = OrcaScorer("gemma-4b")                                  # a published model
@@ -132,7 +134,7 @@ class OrcaScorer:
 
     def __init__(
         self,
-        model: str = "gemma-4b",
+        model: str,
         var_threshold: Optional[float] = None,
         tokenizer_path: Optional[str] = None,
         device: Optional[str] = None,
@@ -144,6 +146,7 @@ class OrcaScorer:
         scoring_model, tokenizer = load_model_and_tokenizer(
             spec.model_path, spec.tokenizer_path, torch_device
         )
+        self.version = spec.version
         threshold = var_threshold if var_threshold is not None else spec.var_threshold
         self._setup(
             scoring_model,
@@ -181,6 +184,7 @@ class OrcaScorer:
             The scorer.
         """
         scorer = cls.__new__(cls)
+        scorer.version = "model passed in by the caller"
         scorer._setup(
             model,
             tokenizer,
@@ -248,7 +252,7 @@ class OrcaScorer:
 
         Returns:
             One dict per pair, in the same order, with orca_score, orca_variance and
-            orca_score_clamped (None if no threshold is set).
+            orca_score_clamped (None if no threshold is set) and orca_model.
         """
         items = [self._make_item(p) for p in pairs]
         predictions = predict(
@@ -259,7 +263,14 @@ class OrcaScorer:
             clamped = (
                 None if self.var_threshold is None else clamp_orca_score(s, v, self.var_threshold)
             )
-            results.append({"orca_score": s, "orca_variance": v, "orca_score_clamped": clamped})
+            results.append(
+                {
+                    "orca_score": s,
+                    "orca_variance": v,
+                    "orca_score_clamped": clamped,
+                    "orca_model": self.version,
+                }
+            )
         return results
 
     def score(
@@ -274,7 +285,7 @@ class OrcaScorer:
             context: Optional rationale and/or transcript for the judge.
 
         Returns:
-            Dict with orca_score, orca_variance and orca_score_clamped.
+            Dict with orca_score, orca_variance, orca_score_clamped and orca_model.
         """
         pair = {"question": question, "reference": reference, "candidate": candidate}
         if context is not None:
@@ -287,7 +298,8 @@ def score(
     reference: str,
     candidate: str,
     context: Optional[str] = None,
-    model: str = "gemma-4b",
+    *,
+    model: str,
     **scorer_kwargs,
 ) -> dict:
     """Score one pair, loading the model on the first call and keeping it for later calls.
@@ -297,12 +309,12 @@ def score(
         reference: The correct answer.
         candidate: The answer to be judged.
         context: Optional rationale and/or transcript for the judge.
-        model: Model name or local directory (see OrcaScorer).
+        model: Model name or local directory (see OrcaScorer); there is no default model.
         **scorer_kwargs: Further OrcaScorer arguments (var_threshold, device, ...); they only
             matter for the call that loads the model.
 
     Returns:
-        Dict with orca_score, orca_variance and orca_score_clamped.
+        Dict with orca_score, orca_variance, orca_score_clamped and orca_model.
     """
     if model not in _DEFAULT_SCORERS:
         _DEFAULT_SCORERS[model] = OrcaScorer(model, **scorer_kwargs)

@@ -35,8 +35,11 @@ The **corrected and rephrased** [MMAU and MMAR benchmarks](benchmarks/README.md)
 Python 3.12 or newer.
 
 ```bash
-pip install -e .
+pip install orca-score            # scoring
+pip install "orca-score[train]"   # also training
 ```
+
+From a clone of this repository: `pip install -e .`
 
 With [uv](https://docs.astral.sh/uv/):
 
@@ -62,8 +65,10 @@ orca-score --model /path/to/model_dir --input my_data.jsonl --var_threshold 0.05
 ready for scoring: a local directory that contains `model/` and `tokenizer/`, for example a training
 checkpoint `.../best`.
 
-Published models are downloaded from Hugging Face on first use, together with
-their base language model (for example Gemma), which may require accepting its license.
+There is no default model: always pass `--model`. Published models are downloaded from Hugging Face
+on first use, together with their base language model (for example Gemma), which may require
+accepting its license. `orca-score --download gemma-4b` fetches them in advance, and
+`orca-score --list` shows what is available.
 
 **Input:** JSONL, one object per line.
 
@@ -81,6 +86,7 @@ their base language model (for example Gemma), which may require accepting its l
 | `orca_score` | predicted correctness, 0 to 1 |
 | `orca_variance` | predicted variance of the human ratings (annotator disagreement) |
 | `orca_score_clamped` | `orca_score` with confident, extreme scores set to 0 or 1 (see below); only written if a threshold is available |
+| `orca_model` | the model that produced the scores: name, date its files were last updated on Hugging Face, and commit (`olmo-1b, updated 2026-06-30 (ad2a16b3)`); `local: <dir>` for a local model |
 
 `orca_variance` is only meaningful for models fine-tuned on human ratings (stage 3); models trained
 only on stages 1 and 2 do not predict disagreement well.
@@ -95,9 +101,9 @@ pass `--var_threshold`; without it only `orca_score` and `orca_variance` are wri
 ```python
 from orca_score.scorer import OrcaScorer, score
 
-score(question="...", reference="...", candidate="...", context="...")   # context optional
+score(question="...", reference="...", candidate="...", context="...", model="gemma-4b")   # context optional
 
-scorer = OrcaScorer("gemma-4b")    # or OrcaScorer("/path/to/model_dir", var_threshold=0.05)
+scorer = OrcaScorer("gemma-4b")    # the model is always given; or OrcaScorer("/path/to/model_dir", var_threshold=0.05)
 scorer.score_many([{"question": "...", "reference": "...", "candidate": "..."}])
 ```
 

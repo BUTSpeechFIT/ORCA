@@ -13,6 +13,7 @@ Authors: Bolaji Yusuf, Santosh Kesiraju
 """
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -24,8 +25,10 @@ from orca_score.metrics import agreement_metrics
 
 def orca_train():
     """Entry point for orca-train command."""
-    from orca_score.train import main
-
+    try:
+        from orca_score.train import main
+    except ModuleNotFoundError as exc:
+        sys.exit(f"ERROR: {exc}. Training needs extra packages: pip install 'orca-score[train]'")
     main()
 
 
@@ -46,9 +49,9 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model",
-        default="gemma-4b",
+        default=None,
         help="Name of a published ORCA model (" + ", ".join(hub.MODELS) + ") or a local model "
-        "directory.",
+        "directory. Required; there is no default model.",
     )
     parser.add_argument(
         "--input",
@@ -83,10 +86,21 @@ def parse_arguments() -> argparse.Namespace:
         help="Ignore the context field, even if the data has one.",
     )
     parser.add_argument(
-        "--list", action="store_true", help="List the available models and files, then exit."
+        "--download",
+        metavar="MODEL",
+        help="Download a published model (and its base language model) for later use, then exit.",
+    )
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="List the available models and files, then exit.",
     )
     args = parser.parse_args()
-    if not args.list and not args.input:
+    if args.list or args.download:
+        return args
+    if not args.model:
+        parser.error("--model is required (one of: " + ", ".join(hub.MODELS) + ", or a directory)")
+    if not args.input:
         parser.error(
             "--input is required (a JSONL file or one of: " + ", ".join(hub.DATASETS) + ")"
         )
@@ -103,6 +117,23 @@ def list_resources() -> None:
     for name, filename in hub.DATASETS.items():
         print(f"  {name:10s} {hub.DATASET_REPO}/{filename}")
     print("  or the path of a local .jsonl file")
+
+
+def download_models(name: str) -> None:
+    """Download a published model and its base language model, then print its version.
+
+    Args:
+        name: Name of a published model.
+    """
+    try:
+        spec = hub.resolve_model(name)
+        base = json.loads((spec.model_path / "lm" / "adapter_config.json").read_text())
+        from huggingface_hub import snapshot_download
+
+        snapshot_download(base["base_model_name_or_path"])
+    except (ValueError, FileNotFoundError, RuntimeError, OSError) as exc:
+        sys.exit(f"ERROR: {exc}")
+    print(f"Downloaded {spec.version}")
 
 
 def print_metrics(metrics: dict) -> None:
@@ -124,6 +155,9 @@ def orca_score_cmd() -> None:
     args = parse_arguments()
     if args.list:
         list_resources()
+        return
+    if args.download:
+        download_models(args.download)
         return
 
     try:
@@ -157,6 +191,7 @@ def orca_score_cmd() -> None:
     except (ValueError, FileNotFoundError, RuntimeError) as exc:
         sys.exit(f"ERROR: {exc}")
 
+    print(f"Model: {scorer.version}", flush=True)
     if scorer.var_threshold is not None:
         origin = "--var_threshold" if args.var_threshold else "published model"
         print(f"Clamping threshold {scorer.var_threshold} ({origin})", flush=True)
@@ -170,7 +205,12 @@ def orca_score_cmd() -> None:
     results = scorer.score_many(data.rows, progress=True)
     scored = []
     for row, result in zip(data.rows, results):
-        out = {**row, "orca_score": result["orca_score"], "orca_variance": result["orca_variance"]}
+        out = {
+            **row,
+            "orca_score": result["orca_score"],
+            "orca_variance": result["orca_variance"],
+            "orca_model": result["orca_model"],
+        }
         if scorer.var_threshold is not None:
             out["orca_score_clamped"] = result["orca_score_clamped"]
         scored.append(out)

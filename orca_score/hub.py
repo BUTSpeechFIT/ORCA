@@ -32,12 +32,14 @@ class ModelSpec:
         tokenizer_path: Tokenizer directory.
         score_type: Score type of the model (for example "multinomial").
         var_threshold: Clamping threshold of a published model, or None.
+        version: Label of the model for the output, e.g. "olmo-1b, updated 2026-06-30 (ad2a16b3)".
     """
 
     model_path: Path
     tokenizer_path: Path
     score_type: str
     var_threshold: Optional[float]
+    version: str
 
 
 def import_hf_hub():
@@ -54,6 +56,53 @@ def import_hf_hub():
         raise RuntimeError(
             "huggingface_hub is needed to download from Hugging Face: pip install huggingface_hub"
         ) from exc
+
+
+def published_version(name: str, snapshot: Path) -> str:
+    """Describe the downloaded version of a published model.
+
+    The date is when the model files (model/) were last updated on the Hub, not the date of
+    later edits of the model card. It is left out if the Hub cannot be reached.
+
+    Args:
+        name: Name of the published model (a key of MODELS).
+        snapshot: Local snapshot directory; its name is the commit hash.
+
+    Returns:
+        Label such as "olmo-1b, updated 2026-06-30 (ad2a16b3)".
+    """
+    label = f"{name}, commit {snapshot.name[:8]}"
+    try:
+        entries = (
+            import_hf_hub()
+            .HfApi()
+            .list_repo_tree(
+                MODELS[name]["repo"], path_in_repo="model", revision=snapshot.name, expand=True
+            )
+        )
+        dates = [e.last_commit.date for e in entries if getattr(e, "last_commit", None)]
+        if dates:
+            label = f"{name}, updated {max(dates):%Y-%m-%d} ({snapshot.name[:8]})"
+    except Exception:  # offline or Hub error: the commit hash alone still identifies the model
+        pass
+    return label
+
+
+def download_model(name: str) -> Path:
+    """Download a published model (without loading it).
+
+    Args:
+        name: Name of a published model (a key of MODELS).
+
+    Returns:
+        The local snapshot directory.
+
+    Raises:
+        FileNotFoundError: If the name is not a published model.
+    """
+    if name not in MODELS:
+        raise FileNotFoundError(f"'{name}' is not a published model ({', '.join(MODELS)})")
+    return Path(import_hf_hub().snapshot_download(repo_id=MODELS[name]["repo"]))
 
 
 def resolve_model(model: str, tokenizer_path: Optional[str] = None) -> ModelSpec:
@@ -74,11 +123,12 @@ def resolve_model(model: str, tokenizer_path: Optional[str] = None) -> ModelSpec
     """
     threshold = None
     if model in MODELS:
-        hf_hub = import_hf_hub()
-        root = Path(hf_hub.snapshot_download(repo_id=MODELS[model]["repo"]))
+        root = download_model(model)
         threshold = MODELS[model]["var_threshold"]
+        version = published_version(model, root)
     else:
         root = Path(model.rstrip("/") or "/")
+        version = f"local: {root}"
         if not root.is_dir():
             raise FileNotFoundError(
                 f"model '{model}' is neither a published model ({', '.join(MODELS)}) nor an "
@@ -101,7 +151,9 @@ def resolve_model(model: str, tokenizer_path: Optional[str] = None) -> ModelSpec
         )
 
     config = yaml.safe_load((model_path / "config.yaml").read_text()) or {}
-    return ModelSpec(model_path, tokenizer, config.get("score_type", "multinomial"), threshold)
+    return ModelSpec(
+        model_path, tokenizer, config.get("score_type", "multinomial"), threshold, version
+    )
 
 
 def resolve_data(data: str) -> Path:
