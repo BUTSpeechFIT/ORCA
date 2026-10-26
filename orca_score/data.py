@@ -23,6 +23,51 @@ class DataItem(dict):
         return self
 
 
+CONTEXT_PREFIX = "|context: "
+QUESTION_PREFIX = "|question: "
+ANSWER_PREFIX = "|correct answer: "
+CANDIDATE_PREFIX = "|candidate answer: "
+TRANSCRIPT_PREFIX = "|transcription: "
+
+
+def format_model_input(
+    question,
+    reference,
+    candidate,
+    context=None,
+    prompt="",
+    skip_rationale=False,
+    skip_question=False,
+):
+    """Build the text the ORCA model reads for one question, reference answer and candidate answer.
+
+    This is the single definition of the input format, used by the training and inference
+    data loader and by the Python scoring API. The fields are joined with the prefixes
+    ``|context:``, ``|question:``, ``|correct answer:`` and ``|candidate answer:``. The context
+    field is left out when there is no context (empty or None) or when ``skip_rationale`` is set.
+
+    Args:
+        question: The question text.
+        reference: The correct answer.
+        candidate: The answer to be judged.
+        context: The rationale and/or transcript for the judge; may be empty or None.
+        prompt: Optional text put in front of the fields.
+        skip_rationale: Leave out the context field.
+        skip_question: Leave out the question field.
+
+    Returns:
+        The input text.
+    """
+    text = f"{prompt}"
+    if not skip_rationale and (context or "").strip():
+        text += f" {CONTEXT_PREFIX}{context}"
+    if not skip_question:
+        text += f" {QUESTION_PREFIX}{question}"
+    text += f" {ANSWER_PREFIX}{reference}"
+    text += f" {CANDIDATE_PREFIX}{candidate}"
+    return text
+
+
 class UnifiedAnnotationDataset(Dataset):
     def __init__(
         self,
@@ -34,20 +79,36 @@ class UnifiedAnnotationDataset(Dataset):
         add_transcript=False,
         log_fn=None,
         normalize_ratings=True,
+        rationale_dropout=0.0,
     ):
         """
-        A dataset that loads annotations from a JSONL file and formats them for training.
+        A dataset that loads annotations from a JSONL file and formats
+        them for training.
 
         Args:
             annotations_file: Path to the JSONL file containing annotations.
-            prompts: List of prompts to randomly sample a prompt to be prepended to the data. If None, a default empty prompt is used.
-            filter_func: A function that takes an item and returns True if the item should be included in the dataset, False otherwise.
-            log_fn: Optional logging function. If provided, will log filtering statistics.
-            normalize_ratings: If True, will normalize ratings originally in the range [1, 5] to the range [0, 1] by subtracting 1 and dividing by 4. If False, will keep original rating values.
-                NOTE: pass normalize_ratings=False when using score_type='multinomial' so that
-                raw integer ratings [1,5] are preserved; multinomial_llh in model.py expects
-                unnormalized labels and handles the 1-5 → 0-4 index shift internally.
+            prompts: List of prompts to randomly sample a prompt to be prepended
+                to the data. If None, a default empty prompt is used.
+            filter_func: A function that takes an item and returns True if the
+                item should be included in the dataset, False otherwise.
+            log_fn: Optional logging function. If provided, will log
+                filtering statistics.
+            normalize_ratings: If True, will normalize ratings originally in
+                the range [1, 5] to the range [0, 1] by subtracting 1 and
+                dividing by 4. If False, will keep original rating values.
+                NOTE: pass normalize_ratings=False when using
+                score_type='multinomial' so that raw integer ratings [1,5] are
+                preserved; multinomial_llh in model.py expects
+                unnormalized labels and handles the 1-5 → 0-4 index shift
+                internally.
+            rationale_dropout: Probability of dropping the rationale of a
+                sample at access time (training-time augmentation so that the
+                model also works without a rationale).
+                Applied only after the dataset has been built, so that filter_func always sees
+                the full, undropped text. Ignored if skip_rationale is True.
         """
+        if not 0.0 <= rationale_dropout <= 1.0:
+            raise ValueError(f"rationale_dropout must be in [0, 1], got {rationale_dropout}")
 
         self.annotations = []
         self.annotation_keys = []
@@ -60,12 +121,14 @@ class UnifiedAnnotationDataset(Dataset):
                     self.annotation_keys.append(data_dict["id"])
 
         self.prompts = prompts if prompts is not None else [""]
-        self.context_prefix = "|context: "
-        self.question_prefix = "|question: "
-        self.answer_prefix = "|correct answer: "
-        self.candidate_prefix = "|candidate answer: "
-        self.transcript_prefix = "|transcription: "
+        self.context_prefix = CONTEXT_PREFIX
+        self.question_prefix = QUESTION_PREFIX
+        self.answer_prefix = ANSWER_PREFIX
+        self.candidate_prefix = CANDIDATE_PREFIX
+        self.transcript_prefix = TRANSCRIPT_PREFIX
         self.skip_rationale = skip_rationale
+        # Dropout stays off while filtering; it is switched on at the end of __init__.
+        self.rationale_dropout = 0.0
         self.skip_question = skip_question
         self.add_transcript = add_transcript
         self.log_fn = log_fn or print
@@ -87,6 +150,8 @@ class UnifiedAnnotationDataset(Dataset):
             # self.model_ids = ["_".join(key.split("_")[-2:]) for key in self.annotation_keys]
             self.log_fn(f"Length after filtering: {len(self.annotation_keys)}")
 
+        self.rationale_dropout = rationale_dropout
+
     def __len__(self):
         return len(self.annotation_keys)
 
@@ -97,6 +162,8 @@ class UnifiedAnnotationDataset(Dataset):
         item = self.annotations[idx]
         prompt = random.choice(self.prompts)
         context = item["rationale"]
+        if self.rationale_dropout > 0.0 and random.random() < self.rationale_dropout:
+            context = ""
         question = item["question"]
         answer = item["reference"]
         candidate_answer = item["candidate"]
@@ -127,13 +194,15 @@ class UnifiedAnnotationDataset(Dataset):
         #     f'{self.answer_prefix}{answer} '
         #     f'{self.candidate_prefix}{candidate_answer}'
         # )
-        format_free = f"{prompt}"
-        if not self.skip_rationale:
-            format_free += f" {self.context_prefix}{context}"
-        if not self.skip_question:
-            format_free += f" {self.question_prefix}{question}"
-        format_free += f" {self.answer_prefix}{answer}"
-        format_free += f" {self.candidate_prefix}{candidate_answer}"
+        format_free = format_model_input(
+            question,
+            answer,
+            candidate_answer,
+            context=context,
+            prompt=prompt,
+            skip_rationale=self.skip_rationale,
+            skip_question=self.skip_question,
+        )
 
         return {
             "text": format_free,
@@ -160,13 +229,15 @@ class UnifiedAnnotationDataset(Dataset):
             context = item["rationale"]
             if self.add_transcript and "transcription" in item:
                 context = f"{self.transcript_prefix}{item['transcription']} {context}"
-            text = prompt
-            if not self.skip_rationale:
-                text += f" {self.context_prefix}{context}"
-            if not self.skip_question:
-                text += f" {self.question_prefix}{item['question']}"
-            text += f" {self.answer_prefix}{item['reference']}"
-            text += f" {self.candidate_prefix}{item['candidate']}"
+            text = format_model_input(
+                item["question"],
+                item["reference"],
+                item["candidate"],
+                context=context,
+                prompt=prompt,
+                skip_rationale=self.skip_rationale,
+                skip_question=self.skip_question,
+            )
             lengths.append(len(text))
         return lengths
 

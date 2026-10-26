@@ -19,7 +19,7 @@
 
 The **corrected and rephrased** [MMAU and MMAR benchmarks](benchmarks/README.md) can be used for open-ended evaluation.
 
-**Models:**
+**Published ORCA models (ready for scoring):**
 - [orca-gemma-3-4b-it-multinomial](https://huggingface.co/BUT-FIT/orca-gemma-3-4b-it-multinomial)
 - [orca-llama-3.2-3b-it-multinomial](https://huggingface.co/BUT-FIT/orca-llama-3.2-3b-it-multinomial)
 - [orca-olmo-2-1b-multinomial](https://huggingface.co/BUT-FIT/orca-olmo-2-1b-multinomial)
@@ -30,88 +30,97 @@ The **corrected and rephrased** [MMAU and MMAR benchmarks](benchmarks/README.md)
 
 ---
 
-
 ## Installation
 
+Python 3.12 or newer.
+
 ```bash
-# Python 3.12+ required
 pip install -e .
 ```
 
-Using [uv](https://docs.astral.sh/uv/) (recommended for development):
+With [uv](https://docs.astral.sh/uv/):
 
 ```bash
 uv venv --python 3.12 && source .venv/bin/activate
-uv pip install -e ".[dev]"
+uv pip install -e . --group dev
 ```
 
-## Inference with pre-trained models
-
-The `download_and_infer.py` script handles everything — model download, data download, inference, and score clamping:
+## Answer correctness assessment (scoring)
 
 ```bash
-python download_and_infer.py --model gemma-4b --benchmark mmau-pro
+orca-score --model gemma-4b --input my_data.jsonl --output scored.jsonl  # our pre-trained model on your data
 ```
-
-Available options:
-- `--model`: `gemma-4b`, `llama-3b`, `olmo-1b` (default)
-- `--benchmark`: `mmau-pro` (default), `mmau-mmar`
-- `--stages 1 2 3 4`: run all steps (default) or a subset -- e.g. `--stages 3 4` to skip downloading
-- `--var_threshold`: override the clamping threshold (default: per-model calibrated value)
-
-Results are written to `results/<model>/<benchmark>/final_result.jsonl` (`rating_orca`, `variance_orca` per item) and `score_clamp.yaml` (Spearman, Kendall, MAE).
-
-### Manual steps
+```bash
+orca-score --model gemma-4b --input mmau-pro  # our pre-trained model on our human-rated test set
+```
 
 ```bash
-# 1. Download a model
-pip install huggingface_hub
-hf download BUT-FIT/orca-gemma-3-4b-it-multinomial --local-dir orca-gemma-4b
-
-# 2. Prepare input JSONL (one item per line)
-# Required fields: question, reference, candidate, rationale
-# Optional: ratings (list of int 1–5) to get Spearman/Kendall/MAE metrics
-
-# 3. Run inference
-orca-infer --model_path orca-gemma-4b/model --data_jsonl your_data.jsonl --output_dir results/
-
-# 4. Apply clamping
-python -m orca_score.clamp --apply_dir results/your_data --var_threshold 0.05
+orca-score --model /path/to/model_dir --input my_data.jsonl --var_threshold 0.05   # your model on your data
 ```
+
+`--model` takes a published ORCA model (`gemma-4b`, `llama-3b`, `olmo-1b`) or a trained ORCA model
+ready for scoring: a local directory that contains `model/` and `tokenizer/`, for example a training
+checkpoint `.../best`.
+
+Published models are downloaded from Hugging Face on first use, together with
+their base language model (for example Gemma), which may require accepting its license.
+
+**Input:** JSONL, one object per line.
+
+| field | |
+|---|---|
+| `question`, `reference`, `candidate` | required: the question, the correct answer, the answer to judge |
+| `context` | optional: a rationale and/or a transcript for the judge (`rationale` is accepted as another name); `--skip_context` ignores it |
+| `id` | optional: label copied to the output (need not be unique) |
+| `ratings` | optional: human ratings (1-5); if every row has them, Spearman, Kendall and MAE are reported |
+
+**Output:** JSONL with the input fields plus
+
+| field | |
+|---|---|
+| `orca_score` | predicted correctness, 0 to 1 |
+| `orca_variance` | predicted variance of the human ratings (annotator disagreement) |
+| `orca_score_clamped` | `orca_score` with confident, extreme scores set to 0 or 1 (see below); only written if a threshold is available |
+
+`orca_variance` is only meaningful for models fine-tuned on human ratings (stage 3); models trained
+only on stages 1 and 2 do not predict disagreement well.
+
+**Clamping (`orca_score_clamped`):** a score below 0.125 or above 0.875 is set to 0 or 1 when its
+predicted variance is at most the clamping threshold; all other scores are unchanged
+(`orca_score/clamp.py`). Published models come with a fixed threshold. For your own trained model
+pass `--var_threshold`; without it only `orca_score` and `orca_variance` are written.
+
+**Python:**
+
+```python
+from orca_score.scorer import OrcaScorer, score
+
+score(question="...", reference="...", candidate="...", context="...")   # context optional
+
+scorer = OrcaScorer("gemma-4b")    # or OrcaScorer("/path/to/model_dir", var_threshold=0.05)
+scorer.score_many([{"question": "...", "reference": "...", "candidate": "..."}])
+```
+
+Both return the output fields above (`orca_score_clamped` is `None` without a threshold).
 
 ## Training
 
 ```bash
 orca-train \
-    --train_data /path/to/train.jsonl \
-    --val_data   /path/to/dev.jsonl \
+    --train_data train.jsonl --val_data dev.jsonl \
     --model allenai/OLMo-2-0425-1B-Instruct \
-    --score_type multinomial \
-    --lora_rank 128 \
+    --score_type multinomial --lora_rank 128 \
     --output_dir output/
 ```
 
-Training data is available at [BUT-FIT/orca-audio-qa-annotations](https://huggingface.co/datasets/BUT-FIT/orca-audio-qa-annotations). To reproduce the full three-stage curriculum, train sequentially on `stage1_pretrain` → `stage2_benchmark` → `stage3_mmau_mmar`, passing `--load_checkpoint` between stages.
-
-Run `orca-train --help` and `orca-infer --help` for the full argument reference.
-
-## Model architecture
-
-ORCA fine-tunes a pre-trained LM (Gemma, Llama, OLMo, …) with a LoRA adapter and a small linear scoring head that models the distribution over a 5-point Likert scale, from which a continuous correctness score in [0, 1] and a variance estimate are derived. Score clamping (`orca_score/clamp.py`) optionally hard-clamps extreme, low-variance predictions to 0 or 1.
-
-## Repository structure
-
-```
-orca_score/
-├── model.py    # ORCA model
-├── train.py    # Training loop (orca-train)
-├── infer.py    # Inference (orca-infer)
-├── data.py     # Data loading
-├── clamp.py    # Score clamping
-├── cli.py      # Entry points
-└── utils.py    # Helpers
-download_and_infer.py   # End-to-end convenience script
-```
+- **Data:** [BUT-FIT/orca-audio-qa-annotations](https://huggingface.co/datasets/BUT-FIT/orca-audio-qa-annotations)
+  holds the training and test data pooled by stage (s1, s2, s3).
+  The stratified splits for `s2-mmau-mmar-llm-judge-ratings.jsonl` and `s3-mmau-mmar-human-judge-ratings.jsonl` used for experiments reported in the paper are not included here. Contact us incase you need them.
+- **Curriculum:** train on `s1-synthetic-qa-ratings.jsonl`, `s2-mmau-mmar-llm-judge-ratings.jsonl`,
+  then `s3-mmau-mmar-human-judge-ratings.jsonl`, passing `--load_checkpoint <previous output_dir>/best`
+  between stages.
+- **Rationale dropout:** `--rationale_dropout P` drops the rationale of a training sample with probability `P`.
+- All options: `orca-train --help`.
 
 ## Citation
 
@@ -131,12 +140,7 @@ download_and_infer.py   # End-to-end convenience script
 }
 ```
 
-## License
+## License and contact
 
-MIT License — see [LICENSE](LICENSE).
-
-## Contact
-
-- **Šimon Sedláček** — isedlacek@fit.vut.cz
-- **Bolaji Yusuf** — iyusuf@fit.vut.cz
-- **Santosh Kesiraju** — kesiraju@fit.vut.cz
+MIT License, see [LICENSE](LICENSE).
+Contact: Šimon Sedláček (isedlacek@fit.vut.cz), Bolaji Yusuf (iyusuf@fit.vut.cz), Santosh Kesiraju (kesiraju@fit.vut.cz).

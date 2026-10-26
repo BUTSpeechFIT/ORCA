@@ -68,6 +68,7 @@ def write_to_log(args, total_params, trainable_params, total_batch_size, writer,
     writer.log(f"Validation data: {args.val_data}")
     writer.log(f"Max data length: {args.max_data_length}")
     writer.log(f"Skip rationale: {args.skip_rationale}")
+    writer.log(f"Rationale dropout (train only): {args.rationale_dropout}")
     writer.log(f"Skip question: {args.skip_question}")
     writer.log(f"Add transcript: {args.add_transcript}")
 
@@ -126,6 +127,7 @@ def get_dataloaders(args, tokenizer, writer):
                     add_transcript=args.add_transcript,
                     log_fn=lambda msg: writer.log(msg, to_console=True),
                     normalize_ratings=normalize_ratings,
+                    rationale_dropout=args.rationale_dropout,
                 )
                 for jfile in args.train_data
             ]
@@ -165,6 +167,7 @@ def get_dataloaders(args, tokenizer, writer):
                 add_transcript=args.add_transcript,
                 log_fn=lambda msg: writer.log(msg, to_console=True),
                 normalize_ratings=normalize_ratings,
+                rationale_dropout=args.rationale_dropout,
             )
             for jfile in args.train_data
         ]
@@ -955,6 +958,13 @@ def parse_arguments():
         "--skip_rationale",
         action="store_true",
         help="If set, the model will not use rationales for scoring.",
+    )
+    data_group.add_argument(
+        "--rationale_dropout",
+        type=float,
+        default=0.0,
+        help="Probability of dropping the rationale of a training sample (validation data is "
+        "never affected). Dropped or empty rationales are omitted from the input text.",
     )
     data_group.add_argument(
         "--skip_question",

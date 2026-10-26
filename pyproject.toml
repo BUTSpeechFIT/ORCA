@@ -49,7 +49,7 @@ dev = [
 
 [project.scripts]
 orca-train = "orca_score.cli:orca_train"
-orca-infer = "orca_score.cli:orca_infer"
+orca-score = "orca_score.cli:orca_score_cmd"
 
 [build-system]
 requires = ["hatchling"]
