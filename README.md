@@ -67,7 +67,7 @@ accepting its license. `orca-score --download gemma-4b` fetches them in advance,
 | field | |
 |---|---|
 | `orca_score` | predicted correctness, 0 to 1 |
-| `orca_variance` | predicted variance of the human ratings (annotator disagreement) |
+| `orca_variance` | predicted disagreement among human annotators: the variance of the ratings they would give, on the same 0-1 scale as `orca_score`. Higher means more disagreement, so the question or reference is likely subjective or ambiguous |
 | `orca_score_clamped` | `orca_score` with confident, extreme scores set to 0 or 1 (see below); only written if a threshold is available |
 | `orca_model` | the model that produced the scores: name, date its files were last updated on Hugging Face, and commit (`olmo-1b, updated 2026-06-30 (ad2a16b3)`); `local: <dir>` for a local model |
 
@@ -75,7 +75,7 @@ accepting its license. `orca-score --download gemma-4b` fetches them in advance,
 only on stages 1 and 2 do not predict disagreement well.
 
 **Clamping (`orca_score_clamped`):** a score below 0.125 or above 0.875 is set to 0 or 1 when its
-predicted variance is at most the clamping threshold; all other scores are unchanged
+predicted variance (0-1 scale) is at most the clamping threshold; all other scores are unchanged
 (`orca_score/clamp.py`). Published models come with a fixed threshold. For your own trained model
 pass `--var_threshold`; without it only `orca_score` and `orca_variance` are written.
 
