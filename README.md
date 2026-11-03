@@ -1,34 +1,17 @@
 # ORCA: Open-ended Response Correctness Assessment for Audio Question Answering
 
-**Authors:** Šimon Sedláček¹, Sara Barahona², Cecilia Bolaños³, Laura Herrera-Alarcón², Sathvik Udupa¹, Fernando López², Allison Ferner⁴, Alicia Lozano-Diez², Bolaji Yusuf¹, Santosh Kesiraju¹, Ramani Duraiswami⁵, Jan Černocký¹
+Rate how correct an answer to an audio question is, as a human annotator would. ORCA predicts the
+average human rating and the annotators' disagreement for each answer.
 
-¹Speech@FIT, Brno University of Technology, Czechia &nbsp;·&nbsp;
-²Universidad Autónoma de Madrid, Spain &nbsp;·&nbsp;
-³University of Buenos Aires, Argentina &nbsp;·&nbsp;
-⁴Tufts University, USA &nbsp;·&nbsp;
-⁵University of Maryland, USA
+[Paper](https://doi.org/10.1162/TACL.a.798) (TACL 2026) &nbsp;·&nbsp;
+[Dataset](https://huggingface.co/datasets/BUT-FIT/orca-audio-qa-annotations) &nbsp;·&nbsp;
+[Models](https://huggingface.co/BUT-FIT) &nbsp;·&nbsp;
+[Code](https://github.com/BUTSpeechFIT/ORCA)
 
-**Paper:** [https://doi.org/10.1162/TACL.a.798](https://doi.org/10.1162/TACL.a.798) -- accepted to *Transactions of the ACL 2026*
+![ORCA model: question, reference, rationale and candidate go into a text LLM with a linear head that predicts a distribution over ratings 1-5, giving correctness and disagreement](https://raw.githubusercontent.com/BUTSpeechFIT/ORCA/main/docs/orca_model.png)
 
-![ORCA example](docs/orca_example_tacl.png)
-
-
-**Dataset:** [BUT-FIT/orca-audio-qa-annotations](https://huggingface.co/datasets/BUT-FIT/orca-audio-qa-annotations)
-
-**Corrected benchmarks:**
-
-The **corrected and rephrased** [MMAU and MMAR benchmarks](benchmarks/README.md) can be used for open-ended evaluation.
-
-**Published ORCA models (ready for scoring):**
-- [orca-gemma-3-4b-it-multinomial](https://huggingface.co/BUT-FIT/orca-gemma-3-4b-it-multinomial)
-- [orca-llama-3.2-3b-it-multinomial](https://huggingface.co/BUT-FIT/orca-llama-3.2-3b-it-multinomial)
-- [orca-olmo-2-1b-multinomial](https://huggingface.co/BUT-FIT/orca-olmo-2-1b-multinomial)
-
----
-
-**Abstract:** Reliable assessment of the abilities of large audio language models (LALMs) is essential to advancing the state of the art. As benchmarks rapidly evolve to incorporate complex reasoning and subjective tasks, they increasingly necessitate open-ended responses from LALMs. We present Open-ended Response Correctness Assessment (ORCA) — a reliable and lightweight model-based approach for answer correctness and disagreement modeling. We employ a three-stage annotation pipeline combining human judgment, structured feedback, and human-AI correction, yielding 9,663 annotations across 3,699 question-answer pairs from 15 LALMs on three audio understanding and reasoning benchmarks (achieving a Krippendorff's alpha of 0.82). Our experiments employing curriculum learning show that ORCA models achieve a Spearman correlation of 0.91 with average human correctness ratings on seen benchmarks and generalize to unseen benchmarks with a score of 0.85, outperforming several LLM judge baselines including Gemini 2.5 Flash. Furthermore, we demonstrate that ORCA's predicted variance correlates strongly with human disagreement, allowing it to effectively identify problematic benchmark items.
-
----
+ORCA models reach a Spearman correlation of 0.91 with average human ratings on seen benchmarks and
+0.85 on unseen ones, outperforming several LLM judges including Gemini 2.5 Flash.
 
 ## Installation
 
@@ -109,6 +92,18 @@ scorer.score_many([{"question": "...", "reference": "...", "candidate": "..."}])
 
 Both return the output fields above (`orca_score_clamped` is `None` without a threshold).
 
+## Models, data and benchmarks
+
+**Published ORCA models (ready for scoring):**
+- [orca-gemma-3-4b-it-multinomial](https://huggingface.co/BUT-FIT/orca-gemma-3-4b-it-multinomial)
+- [orca-llama-3.2-3b-it-multinomial](https://huggingface.co/BUT-FIT/orca-llama-3.2-3b-it-multinomial)
+- [orca-olmo-2-1b-multinomial](https://huggingface.co/BUT-FIT/orca-olmo-2-1b-multinomial)
+
+**Dataset:** [BUT-FIT/orca-audio-qa-annotations](https://huggingface.co/datasets/BUT-FIT/orca-audio-qa-annotations)
+
+**Corrected benchmarks:** the **corrected and rephrased** [MMAU and MMAR benchmarks](https://github.com/BUTSpeechFIT/ORCA/blob/main/benchmarks/README.md)
+can be used for open-ended evaluation.
+
 ## Training
 
 ```bash
@@ -127,6 +122,22 @@ orca-train \
   between stages.
 - **Rationale dropout:** `--rationale_dropout P` drops the rationale of a training sample with probability `P`.
 - All options: `orca-train --help`.
+
+## About the paper
+
+![Two examples: question, rationale, reference and candidate answers with the human ratings and the ORCA rating](https://raw.githubusercontent.com/BUTSpeechFIT/ORCA/main/docs/orca_example_tacl.png)
+
+**Abstract:** Reliable assessment of the abilities of large audio language models (LALMs) is essential to advancing the state of the art. As benchmarks rapidly evolve to incorporate complex reasoning and subjective tasks, they increasingly necessitate open-ended responses from LALMs. We present Open-ended Response Correctness Assessment (ORCA) — a reliable and lightweight model-based approach for answer correctness and disagreement modeling. We employ a three-stage annotation pipeline combining human judgment, structured feedback, and human-AI correction, yielding 9,663 annotations across 3,699 question-answer pairs from 15 LALMs on three audio understanding and reasoning benchmarks (achieving a Krippendorff's alpha of 0.82). Our experiments employing curriculum learning show that ORCA models achieve a Spearman correlation of 0.91 with average human correctness ratings on seen benchmarks and generalize to unseen benchmarks with a score of 0.85, outperforming several LLM judge baselines including Gemini 2.5 Flash. Furthermore, we demonstrate that ORCA's predicted variance correlates strongly with human disagreement, allowing it to effectively identify problematic benchmark items.
+
+**Authors:** Šimon Sedláček¹, Sara Barahona², Cecilia Bolaños³, Laura Herrera-Alarcón², Sathvik Udupa¹, Fernando López², Allison Ferner⁴, Alicia Lozano-Diez², Bolaji Yusuf¹, Santosh Kesiraju¹, Ramani Duraiswami⁵, Jan Černocký¹
+
+¹Speech@FIT, Brno University of Technology, Czechia &nbsp;·&nbsp;
+²Universidad Autónoma de Madrid, Spain &nbsp;·&nbsp;
+³University of Buenos Aires, Argentina &nbsp;·&nbsp;
+⁴Tufts University, USA &nbsp;·&nbsp;
+⁵University of Maryland, USA
+
+Paper: [https://doi.org/10.1162/TACL.a.798](https://doi.org/10.1162/TACL.a.798), accepted to *Transactions of the ACL 2026*.
 
 ## Citation
 
@@ -148,5 +159,5 @@ orca-train \
 
 ## License and contact
 
-MIT License, see [LICENSE](LICENSE).
+MIT License, see [LICENSE](https://github.com/BUTSpeechFIT/ORCA/blob/main/LICENSE).
 Contact: Šimon Sedláček (isedlacek@fit.vut.cz), Bolaji Yusuf (iyusuf@fit.vut.cz), Santosh Kesiraju (kesiraju@fit.vut.cz).
