@@ -98,6 +98,7 @@ Both return the output fields above (`orca_score_clamped` is `None` without a th
 - [orca-gemma-3-4b-it-multinomial](https://huggingface.co/BUT-FIT/orca-gemma-3-4b-it-multinomial)
 - [orca-llama-3.2-3b-it-multinomial](https://huggingface.co/BUT-FIT/orca-llama-3.2-3b-it-multinomial)
 - [orca-olmo-2-1b-multinomial](https://huggingface.co/BUT-FIT/orca-olmo-2-1b-multinomial)
+- [orca-llama-3.2-3b-multinomial-no_rationale](https://huggingface.co/BUT-FIT/orca-llama-3.2-3b-multinomial-no_rationale)
 
 **Dataset:** [BUT-FIT/orca-audio-qa-annotations](https://huggingface.co/datasets/BUT-FIT/orca-audio-qa-annotations)
 
